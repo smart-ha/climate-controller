@@ -1,0 +1,38 @@
+set_temperature:
+  name: Set Temperature
+  description: Set target temperature for climate device
+  target:
+    entity:
+      domain: climate
+  fields:
+    temperature:
+      name: Temperature
+      description: Target temperature
+      required: true
+      example: 22
+      selector:
+        number:
+          min: 10
+          max: 30
+          step: 0.5
+          unit_of_measurement: "°C"
+
+set_hvac_mode:
+  name: Set HVAC Mode
+  description: Set HVAC mode for climate device
+  target:
+    entity:
+      domain: climate
+  fields:
+    hvac_mode:
+      name: HVAC Mode
+      description: Target HVAC mode
+      required: true
+      example: "heat"
+      selector:
+        select:
+          options:
+            - "auto"
+            - "cool"
+            - "heat"
+            - "off"

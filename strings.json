@@ -1,0 +1,32 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Climate Controller",
+        "description": "Setup your climate controller device"
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect to device",
+      "invalid_auth": "Invalid authentication",
+      "unknown": "Unknown error"
+    },
+    "abort": {
+      "already_configured": "Device is already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Climate Controller Configuration",
+        "description": "Configure your climate controller settings",
+        "data": {
+          "name": "Configuration Name",
+          "temp_threshold": "Temperature threshold for switching between cooling and heating (°C)",
+          "cooling_devices": "Cooling devices",
+          "heating_devices": "Heating devices"
+        }
+      }
+    }
+  }
+}
