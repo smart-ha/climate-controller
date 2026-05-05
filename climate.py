@@ -6,7 +6,7 @@ import time
 from typing import Any
 
 from homeassistant.components.climate import ClimateEntity, ClimateEntityFeature
-from homeassistant.components.climate.const import HVACMode
+from homeassistant.components.climate.const import HVACAction, HVACMode
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     ATTR_TEMPERATURE,
@@ -97,6 +97,7 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
         self._name = name
         self._config_entry = config_entry
         self._hvac_mode: HVACMode = HVACMode.OFF
+        self._hvac_action: HVACAction = HVACAction.OFF
         self._preset_mode = "work"
         self._preset_temperatures = config_entry.data.get(
             "preset_temperatures",
@@ -132,6 +133,10 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
     @property
     def hvac_mode(self) -> HVACMode:
         return self._hvac_mode
+
+    @property
+    def hvac_action(self) -> HVACAction:
+        return self._hvac_action
 
     @property
     def preset_mode(self) -> str:
@@ -357,6 +362,7 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
 
         setpoint = self._target_temperature
         is_off = self._hvac_mode == HVACMode.OFF
+        net_output: float = 0.0
 
         for key, pid in self._pids.items():
             side, entity_id = key.split(":", 1)
@@ -364,6 +370,7 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
                 # Active device, controller is OFF — leave it alone.
                 continue
             output = pid.update(setpoint, measured, dt_seconds)
+            net_output += output
             _LOGGER.debug(
                 "climate_controller[%s]: side=%s device=%s setpoint=%.2f measured=%.2f dt=%.1fs output=%.3f passive=%s",
                 self._name,
@@ -394,6 +401,18 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
             self.hass.async_create_task(
                 self._actuate(side, entity_id, setpoint, output)
             )
+
+        # Decide hvac_action from the signed sum of PID outputs accumulated
+        # this tick. OFF mode forces OFF regardless of any passive-device
+        # outputs that may have leaked into net_output.
+        if is_off:
+            self._hvac_action = HVACAction.OFF
+        elif net_output > ACTUATION_DEADBAND:
+            self._hvac_action = HVACAction.HEATING
+        elif net_output < -ACTUATION_DEADBAND:
+            self._hvac_action = HVACAction.COOLING
+        else:
+            self._hvac_action = HVACAction.IDLE
 
     async def _actuate(
         self, side: str, entity_id: str, setpoint: float, output: float
@@ -697,6 +716,10 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
         self._hvac_mode = hvac_mode
         if prev != HVACMode.OFF and hvac_mode == HVACMode.OFF:
             await self._suspend_active_devices()
+            # Reflect the OFF state on the entity card immediately — without
+            # this we'd wait up to TICK_INTERVAL_SECONDS for _evaluate to
+            # repaint the ring.
+            self._hvac_action = HVACAction.OFF
         self.async_write_ha_state()
 
     async def _suspend_active_devices(self) -> None:
