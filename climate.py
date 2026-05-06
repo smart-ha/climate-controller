@@ -89,7 +89,10 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
     _attr_hvac_modes = HVAC_MODES
     _attr_preset_modes = PRESET_MODES
     _attr_supported_features = (
-        ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.PRESET_MODE
+        ClimateEntityFeature.TARGET_TEMPERATURE
+        | ClimateEntityFeature.PRESET_MODE
+        | ClimateEntityFeature.TURN_ON
+        | ClimateEntityFeature.TURN_OFF
     )
 
     def __init__(self, name: str, config_entry: ConfigEntry) -> None:
@@ -780,6 +783,16 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
             )
             return True
         return False
+
+    async def async_turn_on(self) -> None:
+        """Generic turn_on — drives external integrations (Yandex Smart Home,
+        Google Assistant, HomeKit) that hit the climate.turn_on service."""
+        await self.async_set_hvac_mode(HVACMode.AUTO)
+
+    async def async_turn_off(self) -> None:
+        """Generic turn_off — drives external integrations that hit the
+        climate.turn_off service."""
+        await self.async_set_hvac_mode(HVACMode.OFF)
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         prev = self._hvac_mode
