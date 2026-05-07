@@ -130,6 +130,11 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
         # the exact target). Not persisted across HA restarts — the next
         # _evaluate tick re-evaluates from current measured/setpoint.
         self._zone: Literal["idle", "heating", "cooling"] = "idle"
+        # On the very first _evaluate after entity startup, devices may be
+        # in stale pre-restart state (heater on, AC in heat) even if our
+        # state machine lands in idle. Force _enter_idle_zone once on
+        # first tick so the known-idle starting condition is restored.
+        self._first_evaluate: bool = True
 
     @property
     def name(self) -> str:
@@ -341,6 +346,31 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
         cfg = self._config_entry.data.get(f"{side}_config", {})
         return bool(cfg.get(entity_id, {}).get("passive", False))
 
+    def _has_active_managed_devices(self) -> bool:
+        """Return True if any non-passive registered device is currently in
+        an active state (switch on, climate in heat/cool/auto/dry/etc.).
+
+        Used while the controller sits in the idle zone to recover from
+        races: if a device was unavailable during _enter_idle_zone and
+        later came back online in stale active state, this returns True so
+        the caller fires another _enter_idle_zone pass.
+        """
+        for key in self._pids:
+            side, entity_id = key.split(":", 1)
+            if self._is_passive(side, entity_id):
+                continue
+            state = self.hass.states.get(entity_id)
+            if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+                continue
+            domain = entity_id.split(".", 1)[0]
+            if domain in ("switch", "input_boolean"):
+                if state.state == "on":
+                    return True
+            elif domain == "climate":
+                if state.state not in (HVACMode.OFF, HVACMode.FAN_ONLY):
+                    return True
+        return False
+
     def _evaluate(self) -> None:
         """Compute PID output for every active device and dispatch actuation."""
         measured = _read_sensor_celsius(
@@ -402,8 +432,22 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
                 )
             if self._zone == "idle":
                 self._hvac_action = HVACAction.IDLE
-                if prev_zone != "idle":
+                # Fire _enter_idle_zone on:
+                # - real transition into idle
+                # - first tick after entity startup (covers post-restart
+                #   stale device state)
+                # - any tick where some non-passive device is still in
+                #   active state (covers race where a device was
+                #   unavailable on a previous _enter_idle_zone pass and
+                #   then came back online in stale state, OR a manual
+                #   user override that flipped a switch on).
+                if (
+                    prev_zone != "idle"
+                    or self._first_evaluate
+                    or self._has_active_managed_devices()
+                ):
                     self.hass.async_create_task(self._enter_idle_zone())
+                self._first_evaluate = False
                 return
             # Active zone — fall through to the PID loop. Set hvac_action
             # immediately so the UI reflects the transition before the
@@ -413,6 +457,7 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
                 if self._zone == "heating"
                 else HVACAction.COOLING
             )
+            self._first_evaluate = False
 
         for key, pid in self._pids.items():
             side, entity_id = key.split(":", 1)
