@@ -15,8 +15,9 @@ OUTPUT_MIN = -10.0
 OUTPUT_MAX = 10.0
 
 # Time-proportional output (PWM) window for switch / input_boolean targets.
-# 600s = 10 minutes balances switch wear against regulation responsiveness.
-PWM_WINDOW_SECONDS = 600
+# 300s = 5 minutes — faster reaction to zone transitions vs the previous
+# 600s, at the cost of more frequent relay toggles.
+PWM_WINDOW_SECONDS = 300
 
 # How often the PID loop is evaluated even when no sensor change occurs.
 # Lets the integral term advance during quiet sensor periods.
