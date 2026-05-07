@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any
+from typing import Any, Literal
 
 from homeassistant.components.climate import ClimateEntity, ClimateEntityFeature
 from homeassistant.components.climate.const import HVACAction, HVACMode
@@ -124,9 +124,12 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
         # Last-warned monotonic timestamp per preset for invalid schedules
         # (rate-limit so a corrupted storage entry doesn't flood the log).
         self._scheduled_warning_ts: dict[str, float] = {}
-        # Runtime-only comfort-zone hysteresis flag. Not persisted across HA
-        # restarts — the next _evaluate tick re-evaluates from current state.
-        self._in_comfort_zone: bool = False
+        # Runtime-only zone state machine: 'idle' | 'heating' | 'cooling'.
+        # Asymmetric hysteresis: width = `temp_threshold` on entry into
+        # active zones, 0 on exit (active zones drive until measured hits
+        # the exact target). Not persisted across HA restarts — the next
+        # _evaluate tick re-evaluates from current measured/setpoint.
+        self._zone: Literal["idle", "heating", "cooling"] = "idle"
 
     @property
     def name(self) -> str:
@@ -369,49 +372,61 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
         setpoint = self._target_temperature
         is_off = self._hvac_mode == HVACMode.OFF
 
-        # Comfort-zone hysteresis: in AUTO, when measured drifts inside
-        # ±temp_threshold of the setpoint, suspend non-passive devices into
-        # idle (fan_only / off) and pin hvac_action to IDLE. Stay there until
-        # |delta| exceeds threshold * 1.5 — then fall through and resume the
-        # normal PID loop with reset PIDs (already done on entry).
+        # Three-zone state machine with asymmetric hysteresis. Width is
+        # `temp_threshold` on entry into active zones (idle → heating /
+        # cooling) and 0 on exit (active zones drive until measured hits
+        # the exact target, then drop into idle).
         if not is_off:
             threshold = float(self._config_entry.data.get("temp_threshold", 1.0))
-            delta = abs(measured - setpoint)
-            if self._in_comfort_zone:
-                if delta > threshold * 1.5:
-                    _LOGGER.info(
-                        "climate_controller[%s]: exiting comfort zone (delta=%.2f, threshold=%.2f)",
-                        self._name,
-                        delta,
-                        threshold,
-                    )
-                    self._in_comfort_zone = False
-                    # Fall through to the PID loop below.
-                else:
-                    self._hvac_action = HVACAction.IDLE
-                    return
-            else:
-                if delta < threshold:
-                    _LOGGER.info(
-                        "climate_controller[%s]: entering comfort zone (delta=%.2f, threshold=%.2f)",
-                        self._name,
-                        delta,
-                        threshold,
-                    )
-                    self._in_comfort_zone = True
-                    self.hass.async_create_task(self._enter_comfort_zone())
-                    self._hvac_action = HVACAction.IDLE
-                    return
-
-        net_output: float = 0.0
+            diff = measured - setpoint
+            prev_zone = self._zone
+            if prev_zone == "heating":
+                if diff >= 0:
+                    self._zone = "idle"
+            elif prev_zone == "cooling":
+                if diff <= 0:
+                    self._zone = "idle"
+            else:  # idle
+                if diff < -threshold:
+                    self._zone = "heating"
+                elif diff > threshold:
+                    self._zone = "cooling"
+            if self._zone != prev_zone:
+                _LOGGER.info(
+                    "climate_controller[%s]: zone transition %s → %s (diff=%.2f, threshold=%.2f)",
+                    self._name,
+                    prev_zone,
+                    self._zone,
+                    diff,
+                    threshold,
+                )
+            if self._zone == "idle":
+                self._hvac_action = HVACAction.IDLE
+                if prev_zone != "idle":
+                    self.hass.async_create_task(self._enter_idle_zone())
+                return
+            # Active zone — fall through to the PID loop. Set hvac_action
+            # immediately so the UI reflects the transition before the
+            # actuation tasks complete.
+            self._hvac_action = (
+                HVACAction.HEATING
+                if self._zone == "heating"
+                else HVACAction.COOLING
+            )
 
         for key, pid in self._pids.items():
             side, entity_id = key.split(":", 1)
             if is_off and not self._is_passive(side, entity_id):
                 # Active device, controller is OFF — leave it alone.
                 continue
+            # In an active zone we only drive same-side and bidir devices;
+            # opposite-side keys were already idled on the idle→active
+            # transition (via _enter_idle_zone) and stay that way.
+            if self._zone == "heating" and side == "cooling":
+                continue
+            if self._zone == "cooling" and side == "heating":
+                continue
             output = pid.update(setpoint, measured, dt_seconds)
-            net_output += output
             _LOGGER.debug(
                 "climate_controller[%s]: side=%s device=%s setpoint=%.2f measured=%.2f dt=%.1fs output=%.3f passive=%s",
                 self._name,
@@ -442,18 +457,6 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
             self.hass.async_create_task(
                 self._actuate(side, entity_id, setpoint, output)
             )
-
-        # Decide hvac_action from the signed sum of PID outputs accumulated
-        # this tick. OFF mode forces OFF regardless of any passive-device
-        # outputs that may have leaked into net_output.
-        if is_off:
-            self._hvac_action = HVACAction.OFF
-        elif net_output > ACTUATION_DEADBAND:
-            self._hvac_action = HVACAction.HEATING
-        elif net_output < -ACTUATION_DEADBAND:
-            self._hvac_action = HVACAction.COOLING
-        else:
-            self._hvac_action = HVACAction.IDLE
 
     async def _actuate(
         self, side: str, entity_id: str, setpoint: float, output: float
@@ -799,10 +802,10 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
         self._hvac_mode = hvac_mode
         if prev != HVACMode.OFF and hvac_mode == HVACMode.OFF:
             await self._suspend_active_devices()
-            # Drop any leftover comfort-zone state so the next AUTO start
+            # Drop any leftover zone state so the next AUTO start
             # re-evaluates from current measured/setpoint without inheriting
-            # a stale flag.
-            self._in_comfort_zone = False
+            # a stale active zone.
+            self._zone = "idle"
             # Reflect the OFF state on the entity card immediately — without
             # this we'd wait up to TICK_INTERVAL_SECONDS for _evaluate to
             # repaint the ring.
@@ -846,9 +849,11 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
             elif domain == "climate":
                 await self._set_climate_off(entity_id)
 
-    async def _enter_comfort_zone(self) -> None:
-        """On entering the comfort zone (|measured − setpoint| < threshold),
-        park every non-passive registered device in idle:
+    async def _enter_idle_zone(self) -> None:
+        """On entering the idle zone (state machine drops out of an active
+        zone after reaching the target, or the room never left the band
+        ``[setpoint − threshold, setpoint + threshold]``), park every
+        non-passive registered device in idle:
 
         * ``switch`` / ``input_boolean`` → ``turn_off`` via :meth:`_set_onoff_device`.
         * ``climate.*`` (incl. bidir) → ``fan_only`` via :meth:`_set_climate_idle`,
@@ -869,7 +874,7 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
                     handle()
                 except Exception:  # noqa: BLE001
                     _LOGGER.exception(
-                        "Failed to cancel PWM off-handle for %s on comfort-zone entry",
+                        "Failed to cancel PWM off-handle for %s on idle-zone entry",
                         key,
                     )
             pid = self._pids.get(key)
