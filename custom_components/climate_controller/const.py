@@ -28,3 +28,15 @@ TICK_INTERVAL_SECONDS = 30
 # devices are unaffected (their PWM fraction already collapses to 0 below
 # ~OUTPUT_MAX/MIN scale, and the existing off-pulse cancellation handles it).
 ACTUATION_DEADBAND = 0.2
+
+# Hard ceiling on how far a climate.* device's set_temperature may deviate
+# from the *currently measured* room temperature (in either direction).
+# Anchoring the clamp to the measurement — not to our setpoint — does two
+# things at once:
+#   * softness: instead of slamming the AC to its minimum when the room is
+#     warm, the device target glides down alongside the room, staying within
+#     this band of the current reading.
+#   * a hard guarantee: the value we send never differs from the measured
+#     temperature by more than this many degrees, for cooling and heating
+#     alike. Prevents the jarring "sensor is 27°C, AC is freezing at 16°C".
+MAX_DEVICE_DELTA_C = 4.0

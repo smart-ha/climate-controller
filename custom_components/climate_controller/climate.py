@@ -6,7 +6,7 @@ import time
 from typing import Any, Literal
 
 from homeassistant.components.climate import ClimateEntity, ClimateEntityFeature
-from homeassistant.components.climate.const import HVACAction, HVACMode
+from homeassistant.components.climate.const import HVACAction, HVACMode, PRESET_NONE
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     ATTR_TEMPERATURE,
@@ -31,6 +31,7 @@ from .const import (
     DEFAULT_KI,
     DEFAULT_KP,
     DOMAIN,
+    MAX_DEVICE_DELTA_C,
     OUTPUT_MAX,
     OUTPUT_MIN,
     PWM_WINDOW_SECONDS,
@@ -42,7 +43,10 @@ from .schedule import normalize_points, target_at
 _LOGGER = logging.getLogger(__name__)
 
 HVAC_MODES = [HVACMode.OFF, HVACMode.AUTO]
-PRESET_MODES = ["work", "chill", "sleep"]
+# PRESET_NONE ("none") is HA's idiom for "no preset active" — selecting it
+# leaves the current target temperature untouched and disables the per-preset
+# time-of-day schedule. The three named presets carry fixed defaults + schedules.
+PRESET_MODES = [PRESET_NONE, "work", "chill", "sleep"]
 
 
 async def async_setup_entry(
@@ -500,11 +504,16 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
                 )
                 continue
             self.hass.async_create_task(
-                self._actuate(side, entity_id, setpoint, output)
+                self._actuate(side, entity_id, setpoint, output, measured)
             )
 
     async def _actuate(
-        self, side: str, entity_id: str, setpoint: float, output: float
+        self,
+        side: str,
+        entity_id: str,
+        setpoint: float,
+        output: float,
+        measured: float,
     ) -> None:
         """Apply the PID output to the configured device."""
         domain = entity_id.split(".", 1)[0]
@@ -512,10 +521,10 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
             # bidir is only ever registered for climate.* in async_added_to_hass.
             # Defensive bail out for anything else — should not happen.
             if domain == "climate":
-                await self._actuate_climate_bidir(entity_id, setpoint, output)
+                await self._actuate_climate_bidir(entity_id, setpoint, output, measured)
             return
         if domain == "climate":
-            await self._actuate_climate(side, entity_id, setpoint, output)
+            await self._actuate_climate(side, entity_id, setpoint, output, measured)
         elif domain in ("switch", "input_boolean"):
             self._update_pwm_fraction(side, entity_id, output)
 
@@ -685,15 +694,30 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
             self.hass.async_create_task(self._start_device_window(key, fraction))
 
     def _compute_climate_target(
-        self, state, setpoint: float, output: float
+        self, state, setpoint: float, output: float, measured: float | None = None
     ) -> float:
         """Compute the set_temperature value for a climate.* device:
-        PID-shifted setpoint, clamped to device min/max, then quantised to
-        the device's `target_temp_step` (Tuya IR ACs report step=1.0 and
-        round whatever we send anyway — quantising on our side lets the
-        state-aware skip see the same value the device will actually hold).
+        PID-shifted setpoint, softly clamped to ``measured ± MAX_DEVICE_DELTA_C``,
+        then clamped to device min/max, then quantised to the device's
+        `target_temp_step` (Tuya IR ACs report step=1.0 and round whatever we
+        send anyway — quantising on our side lets the state-aware skip see the
+        same value the device will actually hold).
+
+        The ``measured``-anchored clamp is what makes regulation gentle: rather
+        than driving the AC to its floor when the room is warm, we never ask for
+        a value further than ``MAX_DEVICE_DELTA_C`` from the current reading, so
+        the device target glides with the room instead of jumping to an extreme.
         """
         target = setpoint + output
+        # Hard, measurement-anchored guarantee (both directions). Applied
+        # before the device min/max clamp so the device's own limits still win
+        # when they are tighter than the band (e.g. an AC that can't go below
+        # 16°C when measured − 4 would be lower).
+        if measured is not None:
+            target = max(
+                measured - MAX_DEVICE_DELTA_C,
+                min(measured + MAX_DEVICE_DELTA_C, target),
+            )
         min_t = state.attributes.get("min_temp")
         max_t = state.attributes.get("max_temp")
         if isinstance(min_t, (int, float)):
@@ -711,7 +735,12 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
         return round(target, 2)
 
     async def _actuate_climate(
-        self, side: str, entity_id: str, setpoint: float, output: float
+        self,
+        side: str,
+        entity_id: str,
+        setpoint: float,
+        output: float,
+        measured: float,
     ) -> None:
         """Drive a climate.* target with PID-shifted set_temperature.
 
@@ -729,7 +758,7 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
             )
             return
 
-        target = self._compute_climate_target(state, setpoint, output)
+        target = self._compute_climate_target(state, setpoint, output, measured)
 
         service_data: dict[str, Any] = {
             "entity_id": entity_id,
@@ -753,7 +782,7 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
         )
 
     async def _actuate_climate_bidir(
-        self, entity_id: str, setpoint: float, output: float
+        self, entity_id: str, setpoint: float, output: float, measured: float
     ) -> None:
         """Drive a climate.* target that is registered on both cooling and
         heating sides. Sign of PID output picks hvac_mode."""
@@ -768,7 +797,7 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
 
         planned_hvac_mode = HVACMode.HEAT if output > 0 else HVACMode.COOL
 
-        target = self._compute_climate_target(state, setpoint, output)
+        target = self._compute_climate_target(state, setpoint, output, measured)
 
         service_data: dict[str, Any] = {
             "entity_id": entity_id,
@@ -855,6 +884,14 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
             # this we'd wait up to TICK_INTERVAL_SECONDS for _evaluate to
             # repaint the ring.
             self._hvac_action = HVACAction.OFF
+        elif prev == HVACMode.OFF and hvac_mode != HVACMode.OFF:
+            # OFF→AUTO: оценить состояние немедленно, не ждать до 30s тика.
+            # _first_evaluate=True re-arm-ит триггер на _enter_idle_zone в
+            # _evaluate — иначе zone уже idle (после _suspend_active_devices),
+            # _has_active_managed_devices=False, и climate.* не переедет в
+            # fan_only до следующей зонной транзиции.
+            self._first_evaluate = True
+            self._evaluate()
         self.async_write_ha_state()
 
     async def _suspend_active_devices(self) -> None:
@@ -933,17 +970,27 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
                 await self._set_climate_idle(entity_id)
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
-        if preset_mode in PRESET_MODES:
-            self._preset_mode = preset_mode
-            if preset_mode in self._preset_temperatures:
-                self._target_temperature = self._preset_temperatures[preset_mode]
-            scheduled = self._scheduled_target_for(preset_mode)
-            if scheduled is not None:
-                self._target_temperature = round(scheduled, 2)
+        if preset_mode not in PRESET_MODES:
+            return
+        self._preset_mode = preset_mode
+        # PRESET_NONE = "no preset": keep whatever target the user last set,
+        # and skip schedule lookup (schedules are keyed by named presets only).
+        if preset_mode == PRESET_NONE:
             self.async_write_ha_state()
+            return
+        if preset_mode in self._preset_temperatures:
+            self._target_temperature = self._preset_temperatures[preset_mode]
+        scheduled = self._scheduled_target_for(preset_mode)
+        if scheduled is not None:
+            self._target_temperature = round(scheduled, 2)
+        self.async_write_ha_state()
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
         temperature = kwargs.get(ATTR_TEMPERATURE)
         if temperature is not None:
             self._target_temperature = temperature
+            # A manual target set overrides the active preset — drop back to
+            # PRESET_NONE so the per-preset schedule (which would otherwise
+            # overwrite this value on the next tick) no longer applies.
+            self._preset_mode = PRESET_NONE
             self.async_write_ha_state()
