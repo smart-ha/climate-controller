@@ -1,0 +1,12 @@
+{
+  "domain": "climate_controller",
+  "name": "Climate Controller",
+  "codeowners": ["@smart-ha"],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/smart-ha/climate-controller",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/smart-ha/climate-controller/issues",
+  "requirements": [],
+  "version": "1.1.0"
+}
