@@ -406,6 +406,14 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
         setpoint = self._target_temperature
         is_off = self._hvac_mode == HVACMode.OFF
 
+        # Passive devices are steered toward the current target on every tick —
+        # in AUTO (both active and idle zones) AND while the controller is OFF —
+        # and are never physically suspended. This is for always-on equipment
+        # (e.g. heating that must keep the room warm even when nobody uses it).
+        # Done before the zone machine's early idle-return so idle-zone and OFF
+        # ticks still regulate them.
+        self._drive_passive_devices(setpoint, measured, dt_seconds)
+
         # Three-zone state machine with asymmetric hysteresis. Width is
         # `temp_threshold` on entry into active zones (idle → heating /
         # cooling) and 0 on exit (active zones drive until measured hits
@@ -465,8 +473,14 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
 
         for key, pid in self._pids.items():
             side, entity_id = key.split(":", 1)
-            if is_off and not self._is_passive(side, entity_id):
-                # Active device, controller is OFF — leave it alone.
+            if self._is_passive(side, entity_id):
+                # Passive devices are already regulated in
+                # _drive_passive_devices() (unconditionally, incl. OFF). Skip
+                # here so their PID isn't advanced twice per tick.
+                continue
+            if is_off:
+                # Non-passive device, controller OFF — stays suspended
+                # (physically turned off on the AUTO→OFF transition).
                 continue
             # In an active zone we only drive same-side and bidir devices;
             # opposite-side keys were already idled on the idle→active
@@ -502,6 +516,52 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
                     entity_id,
                     output,
                 )
+                continue
+            self.hass.async_create_task(
+                self._actuate(side, entity_id, setpoint, output, measured)
+            )
+
+    def _drive_passive_devices(
+        self, setpoint: float, measured: float, dt_seconds: float
+    ) -> None:
+        """Regulate every *passive* device toward ``setpoint`` unconditionally.
+
+        Passive devices (``cfg["passive"] = True``) model always-on equipment —
+        e.g. heating that must keep the room warm even when the room is unused.
+        Unlike normal devices they are:
+
+        * driven by their PID on every tick regardless of ``hvac_mode`` (AUTO
+          active zone, AUTO idle zone, and OFF alike), toward the same current
+          controller target; and
+        * never physically turned off — ``_suspend_active_devices`` and
+          ``_enter_idle_zone`` already skip them.
+
+        Side handling is the same as for normal devices: the actuation layer
+        maps a heating-side output's negative half to no-op, a cooling-side
+        output's positive half to no-op, and a bidir device's sign to hvac_mode.
+        """
+        for key, pid in self._pids.items():
+            side, entity_id = key.split(":", 1)
+            if not self._is_passive(side, entity_id):
+                continue
+            output = pid.update(setpoint, measured, dt_seconds)
+            _LOGGER.debug(
+                "climate_controller[%s]: passive drive side=%s device=%s "
+                "setpoint=%.2f measured=%.2f dt=%.1fs output=%.3f",
+                self._name,
+                side,
+                entity_id,
+                setpoint,
+                measured,
+                dt_seconds,
+                output,
+            )
+            # Same deadband as the main loop: don't nudge climate.* targets for
+            # sub-threshold demand (the room is close enough).
+            if (
+                entity_id.startswith("climate.")
+                and abs(output) < ACTUATION_DEADBAND
+            ):
                 continue
             self.hass.async_create_task(
                 self._actuate(side, entity_id, setpoint, output, measured)
