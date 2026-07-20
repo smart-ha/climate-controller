@@ -16,6 +16,9 @@ jobs:
       - uses: hacs/action@main
         with:
           category: integration
+          # Кастомный репозиторий (не в home-assistant/brands) — пропускаем
+          # проверку brand-ассетов. Остальные проверки HACS остаются.
+          ignore: brands
 
   hassfest:
     name: Hassfest
