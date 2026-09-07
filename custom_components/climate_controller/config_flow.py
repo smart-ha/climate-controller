@@ -8,7 +8,12 @@ from homeassistant.core import callback
 import voluptuous as vol
 from homeassistant.helpers import selector
 
-from .const import DOMAIN
+from .const import (
+    DEFAULT_TEMPERATURE_AGGREGATION,
+    DOMAIN,
+    TEMPERATURE_AGGREGATIONS,
+)
+from .sensors import configured_sensors
 
 DEFAULT_PRESET_TEMPS = {"sleep": 18.0, "work": 23.0, "chill": 24.0}
 PRESETS = ("sleep", "work", "chill")
@@ -85,7 +90,8 @@ class ClimateControllerFlowHandler(config_entries.ConfigFlow):
             data={
                 "name": "Climate Controller",
                 "temp_threshold": 1,
-                "temperature_sensor": None,
+                "temperature_sensors": [],
+                "temperature_aggregation": DEFAULT_TEMPERATURE_AGGREGATION,
                 "cooling_devices": [],
                 "heating_devices": [],
                 "cooling_config": {},
@@ -233,8 +239,13 @@ class ClimateControllerOptionsFlowHandler(config_entries.OptionsFlow):
 
             self.data["name"] = user_input.get("name", "Climate Controller")
             self.data["temp_threshold"] = user_input.get("temp_threshold", 1)
-            self.data["temperature_sensor"] = (
-                user_input.get("temperature_sensor") or None
+            self.data["temperature_sensors"] = [
+                entity_id
+                for entity_id in (user_input.get("temperature_sensors") or [])
+                if entity_id
+            ]
+            self.data["temperature_aggregation"] = user_input.get(
+                "temperature_aggregation", DEFAULT_TEMPERATURE_AGGREGATION
             )
             self.data["preset_temperatures"] = {
                 "sleep": user_input.get("sleep_temp", DEFAULT_PRESET_TEMPS["sleep"]),
@@ -267,16 +278,29 @@ class ClimateControllerOptionsFlowHandler(config_entries.OptionsFlow):
         schema[vol.Required("name", default=self.data.get("name", "Climate Controller"))] = str
         schema[vol.Required("temp_threshold", default=self.data.get("temp_threshold", 1))] = vol.Coerce(float)
 
-        sensor_default = self.data.get("temperature_sensor")
-        sensor_selector = selector.EntitySelector(
-            selector.EntitySelectorConfig(domain="sensor", device_class="temperature")
+        schema[
+            vol.Optional(
+                "temperature_sensors", default=configured_sensors(self.data)
+            )
+        ] = selector.EntitySelector(
+            selector.EntitySelectorConfig(
+                domain="sensor", device_class="temperature", multiple=True
+            )
         )
-        sensor_key = (
-            vol.Optional("temperature_sensor", default=sensor_default)
-            if sensor_default
-            else vol.Optional("temperature_sensor")
+        schema[
+            vol.Required(
+                "temperature_aggregation",
+                default=self.data.get(
+                    "temperature_aggregation", DEFAULT_TEMPERATURE_AGGREGATION
+                ),
+            )
+        ] = selector.SelectSelector(
+            selector.SelectSelectorConfig(
+                options=list(TEMPERATURE_AGGREGATIONS),
+                mode=selector.SelectSelectorMode.DROPDOWN,
+                translation_key="temperature_aggregation",
+            )
         )
-        schema[sensor_key] = sensor_selector
 
         preset_temps = self.data.get("preset_temperatures", DEFAULT_PRESET_TEMPS)
         schema[vol.Required("sleep_temp", default=preset_temps.get("sleep", 18.0))] = vol.Coerce(float)

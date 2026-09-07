@@ -40,3 +40,28 @@ ACTUATION_DEADBAND = 0.2
 #     temperature by more than this many degrees, for cooling and heating
 #     alike. Prevents the jarring "sensor is 27°C, AC is freezing at 16°C".
 MAX_DEVICE_DELTA_C = 4.0
+
+# --- Multi-sensor aggregation --------------------------------------------
+# The controller can be fed several temperature sensors at once — one per
+# room when it drives a whole-house boiler, for instance. They are collapsed
+# into the single "measured" value the PID loop consumes by one of these
+# methods:
+#   mean   — the house on average; the gentlest on fuel
+#   min    — heat until the *coldest* room is satisfied (no room left behind)
+#   max    — stop as soon as the warmest room is satisfied (avoids overheating)
+#   median — like mean, but a single misplaced sensor cannot skew the loop
+AGGREGATION_MEAN = "mean"
+AGGREGATION_MIN = "min"
+AGGREGATION_MAX = "max"
+AGGREGATION_MEDIAN = "median"
+
+TEMPERATURE_AGGREGATIONS = (
+    AGGREGATION_MEAN,
+    AGGREGATION_MIN,
+    AGGREGATION_MAX,
+    AGGREGATION_MEDIAN,
+)
+
+# Mean reduces to "the reading itself" for a single sensor, so upgrading an
+# existing single-sensor setup changes nothing until a second one is added.
+DEFAULT_TEMPERATURE_AGGREGATION = AGGREGATION_MEAN

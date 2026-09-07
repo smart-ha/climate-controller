@@ -30,11 +30,12 @@
       },
       "devices": {
         "title": "Devices & sensors",
-        "description": "Sensor, fixed preset temperatures, and the cooling/heating devices the controller drives.",
+        "description": "Sensors, fixed preset temperatures, and the cooling/heating devices the controller drives. Several temperature sensors can be selected; they are combined into one measurement by the chosen method.",
         "data": {
           "name": "Configuration name",
           "temp_threshold": "Temperature threshold for switching cooling/heating (°C)",
-          "temperature_sensor": "Room temperature sensor",
+          "temperature_sensors": "Room temperature sensors (one or more)",
+          "temperature_aggregation": "How to combine several sensors",
           "sleep_temp": "Default temperature for Sleep preset (°C)",
           "work_temp": "Default temperature for Work preset (°C)",
           "chill_temp": "Default temperature for Chill preset (°C)",
@@ -72,34 +73,62 @@
       },
       "add_sleep": {
         "title": "Add Sleep point",
-        "data": {"time": "Time", "temp": "Temperature (°C)", "_back": "← Cancel (don't add this point)"}
+        "data": {
+          "time": "Time",
+          "temp": "Temperature (°C)",
+          "_back": "← Cancel (don't add this point)"
+        }
       },
       "add_work": {
         "title": "Add Work point",
-        "data": {"time": "Time", "temp": "Temperature (°C)", "_back": "← Cancel (don't add this point)"}
+        "data": {
+          "time": "Time",
+          "temp": "Temperature (°C)",
+          "_back": "← Cancel (don't add this point)"
+        }
       },
       "add_chill": {
         "title": "Add Chill point",
-        "data": {"time": "Time", "temp": "Temperature (°C)", "_back": "← Cancel (don't add this point)"}
+        "data": {
+          "time": "Time",
+          "temp": "Temperature (°C)",
+          "_back": "← Cancel (don't add this point)"
+        }
       },
       "bulk_sleep": {
         "title": "Edit Sleep schedule",
         "description": "Edit any row, or tick its delete box to remove it. Empty schedule = use the fixed Sleep temperature.",
-        "data": {"_back": "← Cancel (discard all changes on this screen)"}
+        "data": {
+          "_back": "← Cancel (discard all changes on this screen)"
+        }
       },
       "bulk_work": {
         "title": "Edit Work schedule",
         "description": "Edit any row, or tick its delete box to remove it. Empty schedule = use the fixed Work temperature.",
-        "data": {"_back": "← Cancel (discard all changes on this screen)"}
+        "data": {
+          "_back": "← Cancel (discard all changes on this screen)"
+        }
       },
       "bulk_chill": {
         "title": "Edit Chill schedule",
         "description": "Edit any row, or tick its delete box to remove it. Empty schedule = use the fixed Chill temperature.",
-        "data": {"_back": "← Cancel (discard all changes on this screen)"}
+        "data": {
+          "_back": "← Cancel (discard all changes on this screen)"
+        }
       }
     },
     "error": {
       "invalid_schedule": "Invalid time or temperature"
+    }
+  },
+  "selector": {
+    "temperature_aggregation": {
+      "options": {
+        "mean": "Average of all sensors",
+        "min": "Minimum — heat until the coldest room is satisfied",
+        "max": "Maximum — stop when the warmest room is satisfied",
+        "median": "Median — ignores a single outlying sensor"
+      }
     }
   }
 }

@@ -22,7 +22,6 @@ from homeassistant.helpers.event import (
     async_track_time_interval,
 )
 from homeassistant.helpers.restore_state import RestoreEntity
-from homeassistant.util.unit_conversion import TemperatureConverter
 import datetime as dt
 
 from .const import (
@@ -38,6 +37,12 @@ from .const import (
     TICK_INTERVAL_SECONDS,
 )
 from .pid import PidController
+from .sensors import (
+    aggregation_method,
+    configured_sensors,
+    read_sensor_celsius,
+    read_temperature_celsius,
+)
 from .schedule import normalize_points, target_at
 
 _LOGGER = logging.getLogger(__name__)
@@ -59,31 +64,6 @@ async def async_setup_entry(
     name = config_entry.data.get("name", "Climate Controller")
     device = ClimateControllerDevice(name, config_entry)
     async_add_entities([device], True)
-
-
-def _read_sensor_celsius(hass: HomeAssistant, entity_id: str | None) -> float | None:
-    """Return the sensor's value converted to Celsius, or None if unusable."""
-    if not entity_id:
-        return None
-    state = hass.states.get(entity_id)
-    if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN, None, ""):
-        return None
-    try:
-        value = float(state.state)
-    except (TypeError, ValueError):
-        return None
-    unit = state.attributes.get("unit_of_measurement")
-    if unit in (UnitOfTemperature.CELSIUS, "°C", "C", None):
-        return value
-    if unit in (UnitOfTemperature.FAHRENHEIT, "°F", "F"):
-        return TemperatureConverter.convert(
-            value, UnitOfTemperature.FAHRENHEIT, UnitOfTemperature.CELSIUS
-        )
-    if unit in (UnitOfTemperature.KELVIN, "K"):
-        return TemperatureConverter.convert(
-            value, UnitOfTemperature.KELVIN, UnitOfTemperature.CELSIUS
-        )
-    return None
 
 
 class ClimateControllerDevice(ClimateEntity, RestoreEntity):
@@ -166,14 +146,37 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
 
     @property
     def current_temperature(self) -> float | None:
-        # Real implementation lands in US-007; keep faked value out.
-        return _read_sensor_celsius(
-            self.hass, self._config_entry.data.get("temperature_sensor")
-        ) if self.hass else None
+        if not self.hass:
+            return None
+        return read_temperature_celsius(self.hass, self._config_entry.data)
 
     @property
     def available(self) -> bool:
         return self._available
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Expose the individual readings behind ``current_temperature``.
+
+        With several sensors feeding one loop, "why is it heating?" is only
+        answerable if you can see each reading and which of them dropped out.
+        """
+        if not self.hass:
+            return {}
+        entry_data = self._config_entry.data
+        sensor_ids = configured_sensors(entry_data)
+        readings = {
+            entity_id: read_sensor_celsius(self.hass, entity_id)
+            for entity_id in sensor_ids
+        }
+        return {
+            "temperature_aggregation": aggregation_method(entry_data),
+            "temperature_sensors": sensor_ids,
+            "temperature_readings": readings,
+            "temperature_sensors_unavailable": [
+                entity_id for entity_id, value in readings.items() if value is None
+            ],
+        }
 
     async def async_added_to_hass(self) -> None:
         """Wire up sensor listener + periodic tick."""
@@ -255,11 +258,11 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
                     DEFAULT_KP, DEFAULT_KI, DEFAULT_KD, OUTPUT_MIN, OUTPUT_MAX
                 )
 
-        sensor_id = self._config_entry.data.get("temperature_sensor")
-        if sensor_id:
+        sensor_ids = configured_sensors(self._config_entry.data)
+        if sensor_ids:
             self._unsub_callbacks.append(
                 async_track_state_change_event(
-                    self.hass, [sensor_id], self._handle_sensor_event
+                    self.hass, sensor_ids, self._handle_sensor_event
                 )
             )
 
@@ -377,12 +380,10 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
 
     def _evaluate(self) -> None:
         """Compute PID output for every active device and dispatch actuation."""
-        measured = _read_sensor_celsius(
-            self.hass, self._config_entry.data.get("temperature_sensor")
-        )
+        measured = read_temperature_celsius(self.hass, self._config_entry.data)
         if measured is None:
             _LOGGER.debug(
-                "climate_controller[%s]: sensor unavailable, skipping eval",
+                "climate_controller[%s]: no usable temperature sensor, skipping eval",
                 self._name,
             )
             return
