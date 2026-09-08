@@ -30,7 +30,7 @@ from .const import (
     DEFAULT_KI,
     DEFAULT_KP,
     DOMAIN,
-    MAX_DEVICE_DELTA_C,
+    DEFAULT_MAX_DEVICE_DELTA_C,
     OUTPUT_MAX,
     OUTPUT_MIN,
     PWM_WINDOW_SECONDS,
@@ -754,11 +754,39 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
         ):
             self.hass.async_create_task(self._start_device_window(key, fraction))
 
+    def _device_max_delta(self, side: str, entity_id: str) -> float:
+        """How far this device's set_temperature may sit from the measurement.
+
+        Configured per climate.* device; falls back to
+        :data:`DEFAULT_MAX_DEVICE_DELTA_C` when unset or unparseable. A bidir
+        device is listed on both sides, and the tighter of the two configured
+        values wins — otherwise one side could quietly loosen a limit the
+        other side deliberately tightened.
+        """
+        sides = ("cooling", "heating") if side == "bidir" else (side,)
+        limits: list[float] = []
+        for one_side in sides:
+            device_config = (
+                self._config_entry.data.get(f"{one_side}_config") or {}
+            ).get(entity_id) or {}
+            try:
+                value = float(device_config["max_delta"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if value > 0:
+                limits.append(value)
+        return min(limits) if limits else DEFAULT_MAX_DEVICE_DELTA_C
+
     def _compute_climate_target(
-        self, state, setpoint: float, output: float, measured: float | None = None
+        self,
+        state,
+        setpoint: float,
+        output: float,
+        measured: float | None = None,
+        max_delta: float | None = None,
     ) -> float:
         """Compute the set_temperature value for a climate.* device:
-        PID-shifted setpoint, softly clamped to ``measured ± MAX_DEVICE_DELTA_C``,
+        PID-shifted setpoint, softly clamped to ``measured ± max_delta``,
         then clamped to device min/max, then quantised to the device's
         `target_temp_step` (Tuya IR ACs report step=1.0 and round whatever we
         send anyway — quantising on our side lets the state-aware skip see the
@@ -766,19 +794,19 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
 
         The ``measured``-anchored clamp is what makes regulation gentle: rather
         than driving the AC to its floor when the room is warm, we never ask for
-        a value further than ``MAX_DEVICE_DELTA_C`` from the current reading, so
-        the device target glides with the room instead of jumping to an extreme.
+        a value further than ``max_delta`` from the current reading, so the
+        device target glides with the room instead of jumping to an extreme.
+        ``max_delta`` comes from the device's own configuration and falls back
+        to :data:`DEFAULT_MAX_DEVICE_DELTA_C`.
         """
+        limit = DEFAULT_MAX_DEVICE_DELTA_C if max_delta is None else max_delta
         target = setpoint + output
         # Hard, measurement-anchored guarantee (both directions). Applied
         # before the device min/max clamp so the device's own limits still win
         # when they are tighter than the band (e.g. an AC that can't go below
-        # 16°C when measured − 4 would be lower).
+        # 16°C when measured − max_delta would be lower).
         if measured is not None:
-            target = max(
-                measured - MAX_DEVICE_DELTA_C,
-                min(measured + MAX_DEVICE_DELTA_C, target),
-            )
+            target = max(measured - limit, min(measured + limit, target))
         min_t = state.attributes.get("min_temp")
         max_t = state.attributes.get("max_temp")
         if isinstance(min_t, (int, float)):
@@ -794,6 +822,33 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
         if step_f > 0:
             target = round(target / step_f) * step_f
         return round(target, 2)
+
+    async def _ensure_hvac_mode(self, entity_id: str, mode: HVACMode) -> None:
+        """Switch a climate.* device into ``mode`` with its own service call.
+
+        ``climate.set_temperature`` carries an ``hvac_mode`` field, but whether
+        it is honoured is up to the integration behind the entity — it is
+        passed straight through to ``async_set_temperature``. tuya_local, for
+        one, reads only preset_mode / temperature / target_temp_{high,low} out
+        of the call and drops the mode silently. A device left in ``off`` then
+        swallows every setpoint we send while reporting no error at all.
+
+        Going through ``set_hvac_mode`` works regardless of the integration,
+        and ``blocking=True`` keeps it ordered ahead of the temperature that
+        follows.
+        """
+        _LOGGER.debug(
+            "climate_controller[%s]: setting %s hvac_mode to %s",
+            self._name,
+            entity_id,
+            mode,
+        )
+        await self.hass.services.async_call(
+            "climate",
+            "set_hvac_mode",
+            {"entity_id": entity_id, "hvac_mode": mode},
+            blocking=True,
+        )
 
     async def _actuate_climate(
         self,
@@ -819,24 +874,27 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
             )
             return
 
-        target = self._compute_climate_target(state, setpoint, output, measured)
+        target = self._compute_climate_target(
+            state, setpoint, output, measured, self._device_max_delta(side, entity_id)
+        )
 
         service_data: dict[str, Any] = {
             "entity_id": entity_id,
             ATTR_TEMPERATURE: target,
         }
-        # If the target device is currently off, also flip it to the right
-        # mode so set_temperature actually has an effect.
+        # A device sitting in `off` ignores set_temperature, so flip it to the
+        # right mode first.
         force_mode_off_path = state.state == HVACMode.OFF
-        if force_mode_off_path:
-            service_data["hvac_mode"] = (
-                HVACMode.HEAT if side == "heating" else HVACMode.COOL
-            )
 
         if not force_mode_off_path and self._already_at_target(
             entity_id, state, planned_hvac_mode=None, planned_target=target
         ):
             return
+
+        if force_mode_off_path:
+            await self._ensure_hvac_mode(
+                entity_id, HVACMode.HEAT if side == "heating" else HVACMode.COOL
+            )
 
         await self.hass.services.async_call(
             "climate", "set_temperature", service_data, blocking=False
@@ -858,12 +916,17 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
 
         planned_hvac_mode = HVACMode.HEAT if output > 0 else HVACMode.COOL
 
-        target = self._compute_climate_target(state, setpoint, output, measured)
+        target = self._compute_climate_target(
+            state,
+            setpoint,
+            output,
+            measured,
+            self._device_max_delta("bidir", entity_id),
+        )
 
         service_data: dict[str, Any] = {
             "entity_id": entity_id,
             ATTR_TEMPERATURE: target,
-            "hvac_mode": planned_hvac_mode,
         }
 
         # If the AC is off (user override) we always re-enable it (option 4A).
@@ -874,6 +937,9 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
             planned_target=target,
         ):
             return
+
+        if state.state != planned_hvac_mode:
+            await self._ensure_hvac_mode(entity_id, planned_hvac_mode)
 
         await self.hass.services.async_call(
             "climate", "set_temperature", service_data, blocking=False

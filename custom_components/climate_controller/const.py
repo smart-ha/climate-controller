@@ -29,8 +29,11 @@ TICK_INTERVAL_SECONDS = 30
 # ~OUTPUT_MAX/MIN scale, and the existing off-pulse cancellation handles it).
 ACTUATION_DEADBAND = 0.2
 
-# Hard ceiling on how far a climate.* device's set_temperature may deviate
+# Default ceiling on how far a climate.* device's set_temperature may deviate
 # from the *currently measured* room temperature (in either direction).
+# Overridable per device: a thermostat driving underfloor heating wants a
+# wider band than an AC that reacts within minutes, so each climate.* device
+# carries its own ``max_delta`` and falls back to this value.
 # Anchoring the clamp to the measurement — not to our setpoint — does two
 # things at once:
 #   * softness: instead of slamming the AC to its minimum when the room is
@@ -39,7 +42,7 @@ ACTUATION_DEADBAND = 0.2
 #   * a hard guarantee: the value we send never differs from the measured
 #     temperature by more than this many degrees, for cooling and heating
 #     alike. Prevents the jarring "sensor is 27°C, AC is freezing at 16°C".
-MAX_DEVICE_DELTA_C = 4.0
+DEFAULT_MAX_DEVICE_DELTA_C = 4.0
 
 # --- Multi-sensor aggregation --------------------------------------------
 # The controller can be fed several temperature sensors at once — one per

@@ -9,6 +9,7 @@ import voluptuous as vol
 from homeassistant.helpers import selector
 
 from .const import (
+    DEFAULT_MAX_DEVICE_DELTA_C,
     DEFAULT_TEMPERATURE_AGGREGATION,
     DOMAIN,
     TEMPERATURE_AGGREGATIONS,
@@ -108,6 +109,25 @@ class ClimateControllerFlowHandler(config_entries.ConfigFlow):
         return ClimateControllerOptionsFlowHandler()
 
 
+def _is_thermostat(entity_id: str) -> bool:
+    """Only climate.* devices take a set_temperature, so only they need a
+    deviation limit — switch / input_boolean are driven by PWM instead."""
+    return entity_id.split(".", 1)[0] == "climate"
+
+
+def _delta_selector() -> selector.NumberSelector:
+    """Selector for the per-device max deviation from the measurement."""
+    return selector.NumberSelector(
+        selector.NumberSelectorConfig(
+            min=0.5,
+            max=20.0,
+            step=0.5,
+            unit_of_measurement="°C",
+            mode=selector.NumberSelectorMode.BOX,
+        )
+    )
+
+
 def _build_device_config(
     new_devices: list[str],
     prev_devices: list[str],
@@ -127,19 +147,43 @@ def _build_device_config(
     for new_i, device in enumerate(new_devices):
         if device in prev_devices:
             prev_i = prev_devices.index(device)
-            new_config[device] = {
+            entry = {
                 "enable": user_input.get(f"{field_prefix}_dev_{prev_i}_enable", True),
                 "passive": user_input.get(f"{field_prefix}_dev_{prev_i}_passive", False),
                 "order": new_i,
             }
+            if _is_thermostat(device):
+                entry["max_delta"] = _coerce_delta(
+                    user_input.get(f"{field_prefix}_dev_{prev_i}_max_delta"),
+                    prev_config.get(device, {}).get("max_delta"),
+                )
         else:
             existing = prev_config.get(device, {})
-            new_config[device] = {
+            entry = {
                 "enable": existing.get("enable", True),
                 "passive": existing.get("passive", False),
                 "order": new_i,
             }
+            if _is_thermostat(device):
+                entry["max_delta"] = _coerce_delta(None, existing.get("max_delta"))
+        new_config[device] = entry
     return new_config
+
+
+def _coerce_delta(submitted, previous) -> float:
+    """First usable of: submitted value, previously stored value, default.
+
+    A device added in the same submission has no form row yet, so it lands on
+    the stored value or the default rather than on nothing.
+    """
+    for candidate in (submitted, previous):
+        try:
+            value = float(candidate)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return DEFAULT_MAX_DEVICE_DELTA_C
 
 
 def _add_device_rows(
@@ -148,7 +192,11 @@ def _add_device_rows(
     config: dict,
     field_prefix: str,
 ) -> None:
-    """Add per-device enable/passive fields to the schema."""
+    """Add per-device enable/passive fields to the schema.
+
+    climate.* devices additionally get a max-deviation field; on/off
+    devices have no set_temperature to clamp.
+    """
     for i, device in enumerate(devices):
         device_config = config.get(device, {})
         schema[
@@ -163,6 +211,13 @@ def _add_device_rows(
                 default=device_config.get("passive", False),
             )
         ] = bool
+        if _is_thermostat(device):
+            schema[
+                vol.Required(
+                    f"{field_prefix}_dev_{i}_max_delta",
+                    default=_coerce_delta(None, device_config.get("max_delta")),
+                )
+            ] = _delta_selector()
 
 
 class ClimateControllerOptionsFlowHandler(config_entries.OptionsFlow):
