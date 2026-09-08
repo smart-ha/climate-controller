@@ -5,3 +5,15 @@ __pycache__/
 .venv/
 .idea/
 .vscode/
+
+# Local deploy credentials (token + SSH password) — never commit, repo is public
+.deploy.env
+
+# Local Claude Code state / instructions
+.claude/settings.local.json
+CLAUDE.md
+
+# Local deploy / sync tooling — specific to this machine's HA host, not for the public repo
+scripts/
+docs
+.claude
