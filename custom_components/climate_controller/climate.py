@@ -266,6 +266,17 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
                 )
             )
 
+        # Следим за управляемыми устройствами: вернувшееся из unavailable
+        # устройство приходит в своём собственном (часто устаревшем) состоянии,
+        # и его нужно сразу привести к тому, что требует контроллер.
+        device_ids = sorted({key.split(":", 1)[1] for key in self._pids})
+        if device_ids:
+            self._unsub_callbacks.append(
+                async_track_state_change_event(
+                    self.hass, device_ids, self._handle_device_event
+                )
+            )
+
         self._unsub_callbacks.append(
             async_track_time_interval(
                 self.hass,
@@ -306,6 +317,67 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
         """Sensor state changed — re-evaluate the loop."""
         self._evaluate()
         self.async_write_ha_state()
+
+    @callback
+    def _handle_device_event(self, event: Event) -> None:
+        """Managed device changed state — reconcile it when it comes back.
+
+        Only the unavailable/unknown/missing → available edge matters. While
+        a device is unavailable every service call to it is skipped (see
+        ``_set_climate_idle`` & co.), so whatever the controller wanted in the
+        meantime was never applied — e.g. a boiler that dropped off during
+        idle-zone entry and then returned in its own ``heat`` mode.
+        """
+        old_state = event.data.get("old_state")
+        new_state = event.data.get("new_state")
+        if new_state is None or new_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            return
+        if old_state is not None and old_state.state not in (
+            STATE_UNAVAILABLE,
+            STATE_UNKNOWN,
+        ):
+            return
+        entity_id = event.data.get("entity_id") or new_state.entity_id
+        _LOGGER.info(
+            "climate_controller[%s]: %s became available (state=%s), reconciling",
+            self._name,
+            entity_id,
+            new_state.state,
+        )
+        self.hass.async_create_task(self._reconcile_device(entity_id))
+
+    async def _reconcile_device(self, entity_id: str) -> None:
+        """Bring a just-returned device in line with the controller state.
+
+        * passive — nothing to do, ``_drive_passive_devices`` steers it every tick;
+        * controller OFF — suspend (same as the AUTO→OFF transition);
+        * idle zone, or active zone of the opposite side — park in idle;
+        * active zone of its own side (or bidir) — re-evaluate right away
+          instead of waiting for the next tick.
+        """
+        if self._first_evaluate:
+            # Зона ещё не вычислена (старт HA / reload): первый _evaluate сам
+            # разберётся с устройствами, не дёргаем их по дефолтной idle-зоне.
+            return
+        needs_evaluate = False
+        for key in list(self._pids):
+            side, key_entity_id = key.split(":", 1)
+            if key_entity_id != entity_id or self._is_passive(side, entity_id):
+                continue
+            if self._hvac_mode == HVACMode.OFF:
+                await self._release_device(key, suspend=True)
+            elif self._zone == "idle" or (
+                side != "bidir" and side != self._zone
+            ):
+                await self._release_device(key, suspend=False)
+            else:
+                # Свежий PID-цикл: накопленный за время недоступности
+                # интеграл не относится к реальному поведению устройства.
+                self._pids[key].reset()
+                needs_evaluate = True
+        if needs_evaluate:
+            self._evaluate()
+            self.async_write_ha_state()
 
     @callback
     def _handle_tick(self, _now) -> None:
@@ -484,8 +556,9 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
                 # (physically turned off on the AUTO→OFF transition).
                 continue
             # In an active zone we only drive same-side and bidir devices;
-            # opposite-side keys were already idled on the idle→active
-            # transition (via _enter_idle_zone) and stay that way.
+            # opposite-side keys were parked when the zone last entered idle
+            # (via _enter_idle_zone), and a device that was unavailable at
+            # that moment is parked on its return by _reconcile_device.
             if self._zone == "heating" and side == "cooling":
                 continue
             if self._zone == "cooling" and side == "heating":
@@ -1039,24 +1112,36 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
             side, entity_id = key.split(":", 1)
             if self._is_passive(side, entity_id):
                 continue
-            handle = self._pwm_off_handles.pop(key, None)
-            if handle is not None:
-                try:
-                    handle()
-                except Exception:  # noqa: BLE001
-                    _LOGGER.exception(
-                        "Failed to cancel PWM off-handle for %s on suspend",
-                        key,
-                    )
-            pid = self._pids.get(key)
-            if pid is not None:
-                pid.reset()
-            self._pwm_fractions.pop(key, None)
-            domain = entity_id.split(".", 1)[0]
-            if domain in ("switch", "input_boolean"):
-                await self._set_onoff_device(domain, entity_id, on=False)
-            elif domain == "climate":
+            await self._release_device(key, suspend=True)
+
+    async def _release_device(self, key: str, suspend: bool) -> None:
+        """Release one non-passive device: cancel its pending PWM off-pulse,
+        reset its PID, drop its duty fraction, then physically turn it off.
+
+        ``suspend=True`` (controller OFF) sends climate.* to ``off``;
+        ``suspend=False`` (idle zone) parks climate.* via
+        :meth:`_set_climate_idle` (``fan_only`` when supported). Switches /
+        input_booleans are turned off either way.
+        """
+        _side, entity_id = key.split(":", 1)
+        handle = self._pwm_off_handles.pop(key, None)
+        if handle is not None:
+            try:
+                handle()
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("Failed to cancel PWM off-handle for %s", key)
+        pid = self._pids.get(key)
+        if pid is not None:
+            pid.reset()
+        self._pwm_fractions.pop(key, None)
+        domain = entity_id.split(".", 1)[0]
+        if domain in ("switch", "input_boolean"):
+            await self._set_onoff_device(domain, entity_id, on=False)
+        elif domain == "climate":
+            if suspend:
                 await self._set_climate_off(entity_id)
+            else:
+                await self._set_climate_idle(entity_id)
 
     async def _enter_idle_zone(self) -> None:
         """On entering the idle zone (state machine drops out of an active
@@ -1077,24 +1162,7 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
             side, entity_id = key.split(":", 1)
             if self._is_passive(side, entity_id):
                 continue
-            handle = self._pwm_off_handles.pop(key, None)
-            if handle is not None:
-                try:
-                    handle()
-                except Exception:  # noqa: BLE001
-                    _LOGGER.exception(
-                        "Failed to cancel PWM off-handle for %s on idle-zone entry",
-                        key,
-                    )
-            pid = self._pids.get(key)
-            if pid is not None:
-                pid.reset()
-            self._pwm_fractions.pop(key, None)
-            domain = entity_id.split(".", 1)[0]
-            if domain in ("switch", "input_boolean"):
-                await self._set_onoff_device(domain, entity_id, on=False)
-            elif domain == "climate":
-                await self._set_climate_idle(entity_id)
+            await self._release_device(key, suspend=False)
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
         if preset_mode not in PRESET_MODES:
