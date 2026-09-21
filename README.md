@@ -288,13 +288,22 @@ Occupancy schedule**:
 через HACS файл нужно скопировать в `config/www/climate-controller/` руками.
 
 Один раз зарегистрировать ресурс: **Настройки → Панели → Ресурсы →
-Добавить**, URL `/local/climate-controller/climate-controller-schedule-card.js`,
+Добавить**, URL
+`/local/climate-controller/climate-controller-schedule-card.js?v=1`,
 тип **Модуль JavaScript**. Затем в дашборд:
 
 ```yaml
 type: custom:climate-controller-schedule-card
 entity: climate.climate_controller
 ```
+
+⚠️ **`?v=1` в URL — не украшение.** HA отдаёт всё из `/local/` с заголовком
+`cache-control: public, max-age=2678400`, то есть кешем на 31 день. Браузер
+этот кеш обходит по Cmd+Shift+R, а приложения-компаньоны (macOS, iOS) — это
+webview без жеста «hard refresh», и они будут показывать старую карточку хоть
+месяц. Поэтому после каждого обновления файла **увеличивай номер в URL
+ресурса** (`?v=2`, `?v=3`, …) — смена URL и есть инвалидация кеша. Ровно по
+этой причине HACS дописывает `?hacstag=…` ко всем своим карточкам.
 
 Клик по ячейке переключает её `обучено → снято руками → авто`, пустую —
 `пусто → включено руками → авто`. Протягиванием выделяется прямоугольник — за
