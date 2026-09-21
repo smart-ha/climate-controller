@@ -9,9 +9,16 @@ import voluptuous as vol
 from homeassistant.helpers import selector
 
 from .const import (
+    DEFAULT_LEARNING_MIN_DAYS,
+    DEFAULT_LEARNING_THRESHOLD,
+    DEFAULT_LEARNING_WEEKS,
     DEFAULT_MAX_DEVICE_DELTA_C,
+    DEFAULT_MOTION_HOLD_MINUTES,
+    DEFAULT_OCCUPANCY_CONFIG,
+    DEFAULT_PREHEAT_MINUTES,
     DEFAULT_TEMPERATURE_AGGREGATION,
     DOMAIN,
+    OCCUPANCY_ACTIONS,
     TEMPERATURE_AGGREGATIONS,
 )
 from .sensors import configured_sensors
@@ -99,6 +106,7 @@ class ClimateControllerFlowHandler(config_entries.ConfigFlow):
                 "heating_config": {},
                 "preset_temperatures": dict(DEFAULT_PRESET_TEMPS),
                 "preset_schedules": {p: [] for p in PRESETS},
+                "occupancy": dict(DEFAULT_OCCUPANCY_CONFIG),
             },
         )
 
@@ -260,11 +268,18 @@ class ClimateControllerOptionsFlowHandler(config_entries.OptionsFlow):
                 self.data["preset_schedules"][p] = _coerce_points(
                     self.data["preset_schedules"].get(p)
                 )
+            occupancy = dict(self.data.get("occupancy") or {})
+            for key, default in DEFAULT_OCCUPANCY_CONFIG.items():
+                occupancy.setdefault(
+                    key, list(default) if isinstance(default, list) else default
+                )
+            self.data["occupancy"] = occupancy
 
         return self.async_show_menu(
             step_id="init",
             menu_options=[
                 "devices",
+                "occupancy",
                 "schedule_sleep",
                 "schedule_work",
                 "schedule_chill",
@@ -546,3 +561,248 @@ class ClimateControllerOptionsFlowHandler(config_entries.OptionsFlow):
 
     async def async_step_bulk_chill(self, user_input=None):
         return await self._handle_bulk("chill", user_input)
+
+    # ------------------------------------------------------------------
+    # Occupancy schedule (24×7 presence grid)
+    # ------------------------------------------------------------------
+
+    def _occupancy(self) -> dict:
+        """The occupancy draft, with every key present."""
+        occupancy = dict(self.data.get("occupancy") or {})
+        for key, default in DEFAULT_OCCUPANCY_CONFIG.items():
+            occupancy.setdefault(
+                key, list(default) if isinstance(default, list) else default
+            )
+        self.data["occupancy"] = occupancy
+        return occupancy
+
+    def _occupancy_store(self):
+        """The learned-history store, or ``None`` before the entry is set up.
+
+        Learned data is deliberately *not* part of ``self.data``: it changes
+        on its own schedule (hourly rollovers, card clicks) and must not be
+        rolled back by a flow that was opened before those happened.
+        """
+        return (
+            self.hass.data.get(DOMAIN, {})
+            .get(self.config_entry.entry_id, {})
+            .get("occupancy")
+        )
+
+    def _occupancy_menu(self):
+        occupancy = self._occupancy()
+        store = self._occupancy_store()
+        sensors = [s for s in (occupancy.get("motion_sensors") or []) if s]
+        lines = [
+            "Schedule: {}".format("on" if occupancy.get("enabled") else "off"),
+            "Motion sensors: {}".format(len(sensors) or "none"),
+            "Threshold: {} over {} week(s)".format(
+                occupancy.get("learning_threshold"),
+                occupancy.get("learning_weeks"),
+            ),
+            "Preheat: {} min".format(occupancy.get("preheat_minutes")),
+        ]
+        if store is not None:
+            lines.append(
+                "Learned: {} day(s), {} manual cell(s)".format(
+                    store.days_observed, store.override_count
+                )
+            )
+        return self.async_show_menu(
+            step_id="occupancy",
+            menu_options=[
+                "occupancy_sensors",
+                "occupancy_learning",
+                "occupancy_actions",
+                "occupancy_maintenance",
+                "init",
+            ],
+            description_placeholders={"summary": "\n".join(lines)},
+        )
+
+    async def async_step_occupancy(self, user_input=None):
+        return self._occupancy_menu()
+
+    async def async_step_occupancy_sensors(self, user_input=None):
+        """Motion sensors, preheat lead time, live-motion hold."""
+        occupancy = self._occupancy()
+        if user_input is not None:
+            if user_input.get("_back"):
+                return self._occupancy_menu()
+            occupancy["enabled"] = bool(user_input.get("enabled", False))
+            occupancy["motion_sensors"] = [
+                entity_id
+                for entity_id in (user_input.get("motion_sensors") or [])
+                if entity_id
+            ]
+            occupancy["preheat_minutes"] = float(
+                user_input.get("preheat_minutes", DEFAULT_PREHEAT_MINUTES)
+            )
+            occupancy["motion_hold_minutes"] = float(
+                user_input.get("motion_hold_minutes", DEFAULT_MOTION_HOLD_MINUTES)
+            )
+            self.data["occupancy"] = occupancy
+            return self._occupancy_menu()
+
+        schema = {
+            vol.Required("enabled", default=bool(occupancy.get("enabled"))): bool,
+            vol.Optional(
+                "motion_sensors",
+                default=[s for s in (occupancy.get("motion_sensors") or []) if s],
+            ): selector.EntitySelector(
+                selector.EntitySelectorConfig(
+                    domain="binary_sensor",
+                    device_class=["motion", "occupancy", "presence"],
+                    multiple=True,
+                )
+            ),
+            vol.Required(
+                "preheat_minutes",
+                default=float(
+                    occupancy.get("preheat_minutes", DEFAULT_PREHEAT_MINUTES)
+                ),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=0, max=480, step=5, mode=selector.NumberSelectorMode.BOX
+                )
+            ),
+            vol.Required(
+                "motion_hold_minutes",
+                default=float(
+                    occupancy.get("motion_hold_minutes", DEFAULT_MOTION_HOLD_MINUTES)
+                ),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=0, max=240, step=5, mode=selector.NumberSelectorMode.BOX
+                )
+            ),
+            vol.Required("_back", default=False): bool,
+        }
+        return self.async_show_form(
+            step_id="occupancy_sensors", data_schema=vol.Schema(schema)
+        )
+
+    async def async_step_occupancy_learning(self, user_input=None):
+        """Window, threshold and the warm-up gate for the learned grid."""
+        occupancy = self._occupancy()
+        if user_input is not None:
+            if user_input.get("_back"):
+                return self._occupancy_menu()
+            occupancy["learning_weeks"] = int(
+                user_input.get("learning_weeks", DEFAULT_LEARNING_WEEKS)
+            )
+            occupancy["learning_threshold"] = float(
+                user_input.get("learning_threshold", DEFAULT_LEARNING_THRESHOLD)
+            )
+            occupancy["learning_min_days"] = int(
+                user_input.get("learning_min_days", DEFAULT_LEARNING_MIN_DAYS)
+            )
+            self.data["occupancy"] = occupancy
+            return self._occupancy_menu()
+
+        schema = {
+            vol.Required(
+                "learning_weeks",
+                default=int(occupancy.get("learning_weeks", DEFAULT_LEARNING_WEEKS)),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=1, max=12, step=1, mode=selector.NumberSelectorMode.BOX
+                )
+            ),
+            vol.Required(
+                "learning_threshold",
+                default=float(
+                    occupancy.get("learning_threshold", DEFAULT_LEARNING_THRESHOLD)
+                ),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=0.05, max=1.0, step=0.05, mode=selector.NumberSelectorMode.BOX
+                )
+            ),
+            vol.Required(
+                "learning_min_days",
+                default=int(
+                    occupancy.get("learning_min_days", DEFAULT_LEARNING_MIN_DAYS)
+                ),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=0, max=30, step=1, mode=selector.NumberSelectorMode.BOX
+                )
+            ),
+            vol.Required("_back", default=False): bool,
+        }
+        return self.async_show_form(
+            step_id="occupancy_learning", data_schema=vol.Schema(schema)
+        )
+
+    async def async_step_occupancy_actions(self, user_input=None):
+        """What the controller does when it enters each of the two states."""
+        occupancy = self._occupancy()
+        if user_input is not None:
+            if user_input.get("_back"):
+                return self._occupancy_menu()
+            occupancy["expected_action"] = user_input.get(
+                "expected_action", DEFAULT_OCCUPANCY_CONFIG["expected_action"]
+            )
+            occupancy["away_action"] = user_input.get(
+                "away_action", DEFAULT_OCCUPANCY_CONFIG["away_action"]
+            )
+            self.data["occupancy"] = occupancy
+            return self._occupancy_menu()
+
+        action_selector = selector.SelectSelector(
+            selector.SelectSelectorConfig(
+                options=list(OCCUPANCY_ACTIONS),
+                mode=selector.SelectSelectorMode.DROPDOWN,
+                translation_key="occupancy_action",
+            )
+        )
+        schema = {
+            vol.Required(
+                "expected_action",
+                default=occupancy.get(
+                    "expected_action", DEFAULT_OCCUPANCY_CONFIG["expected_action"]
+                ),
+            ): action_selector,
+            vol.Required(
+                "away_action",
+                default=occupancy.get(
+                    "away_action", DEFAULT_OCCUPANCY_CONFIG["away_action"]
+                ),
+            ): action_selector,
+            vol.Required("_back", default=False): bool,
+        }
+        return self.async_show_form(
+            step_id="occupancy_actions", data_schema=vol.Schema(schema)
+        )
+
+    async def async_step_occupancy_maintenance(self, user_input=None):
+        """Clear manual cells / forget the learned history.
+
+        Both act on the store immediately rather than on the draft: the store
+        is not what **Save & exit** commits, and a destructive action the user
+        just confirmed should not silently depend on how they leave the flow.
+        """
+        if user_input is not None:
+            if user_input.get("_back"):
+                return self._occupancy_menu()
+            store = self._occupancy_store()
+            if store is not None:
+                if user_input.get("clear_overrides"):
+                    store.clear_overrides()
+                if user_input.get("reset_learning"):
+                    store.reset_learning()
+                if user_input.get("clear_overrides") or user_input.get(
+                    "reset_learning"
+                ):
+                    store.schedule_save()
+            return self._occupancy_menu()
+
+        schema = {
+            vol.Required("clear_overrides", default=False): bool,
+            vol.Required("reset_learning", default=False): bool,
+            vol.Required("_back", default=False): bool,
+        }
+        return self.async_show_form(
+            step_id="occupancy_maintenance", data_schema=vol.Schema(schema)
+        )

@@ -36,3 +36,62 @@ set_hvac_mode:
             - "cool"
             - "heat"
             - "off"
+
+set_occupancy_slot:
+  name: Set occupancy slot
+  description: >-
+    Force one or more cells of the 24×7 presence grid on or off, or hand them
+    back to what the motion sensors learned. Days and hours are applied as a
+    rectangle — every listed day × every listed hour.
+  target:
+    entity:
+      integration: climate_controller
+      domain: climate
+  fields:
+    day:
+      name: Day of week
+      description: 0 = Monday … 6 = Sunday. A single value or a list.
+      required: true
+      example: 0
+      selector:
+        object:
+    hour:
+      name: Hour
+      description: 0–23. A single value or a list.
+      required: true
+      example: 7
+      selector:
+        object:
+    mode:
+      name: Mode
+      description: >-
+        active = always expected, inactive = never expected, auto = drop the
+        override and follow the learned history.
+      required: true
+      example: "active"
+      selector:
+        select:
+          options:
+            - "auto"
+            - "active"
+            - "inactive"
+
+clear_occupancy_overrides:
+  name: Clear occupancy overrides
+  description: >-
+    Drop every manual cell, leaving a purely learned week. The learned history
+    itself is untouched.
+  target:
+    entity:
+      integration: climate_controller
+      domain: climate
+
+reset_occupancy_learning:
+  name: Reset occupancy learning
+  description: >-
+    Forget the observed motion history and start learning the week again.
+    Manual cells are kept.
+  target:
+    entity:
+      integration: climate_controller
+      domain: climate

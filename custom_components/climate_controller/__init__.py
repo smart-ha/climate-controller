@@ -4,7 +4,12 @@ import logging
 from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
 
-from .const import DEFAULT_TEMPERATURE_AGGREGATION, DOMAIN
+from .const import (
+    DEFAULT_OCCUPANCY_CONFIG,
+    DEFAULT_TEMPERATURE_AGGREGATION,
+    DOMAIN,
+)
+from .occupancy import OccupancyStore
 
 PLATFORMS = ["climate"]
 
@@ -20,6 +25,9 @@ def _migrate_entry_data(entry_data: dict) -> tuple[dict, bool]:
     - Strips the obsolete per-device ``sensor`` key that an earlier
       iteration introduced before the design moved to a single
       controller-level sensor.
+    - Fills in the ``occupancy`` block key by key, so an entry written before
+      a given occupancy setting existed picks up its default instead of
+      making every reader guard for a missing key.
     """
     new_data = dict(entry_data)
     changed = False
@@ -49,6 +57,14 @@ def _migrate_entry_data(entry_data: dict) -> tuple[dict, bool]:
                 new_config[device] = device_config
         if changed and key in new_data:
             new_data[key] = new_config
+
+    occupancy = dict(new_data.get("occupancy") or {})
+    for key, default in DEFAULT_OCCUPANCY_CONFIG.items():
+        if key not in occupancy:
+            occupancy[key] = list(default) if isinstance(default, list) else default
+            changed = True
+    new_data["occupancy"] = occupancy
+
     return new_data, changed
 
 
@@ -61,6 +77,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.config_entries.async_update_entry(entry, data=migrated)
         _LOGGER.info("Migrated entry %s to the current data shape", entry.entry_id)
 
+    # Learned occupancy history is runtime data, not configuration: it is
+    # rewritten by every card click and every hourly slot rollover, so it gets
+    # its own Store instead of riding along in the config entry.
+    occupancy_store = OccupancyStore(hass, entry.entry_id)
+    await occupancy_store.async_load()
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
+        "occupancy": occupancy_store,
+    }
+
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     _LOGGER.info("Climate controller setup completed for entry %s", entry.entry_id)
     return True
@@ -69,4 +94,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     _LOGGER.info("Unloading climate controller for entry %s", entry.entry_id)
-    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if unloaded:
+        hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
+    return unloaded

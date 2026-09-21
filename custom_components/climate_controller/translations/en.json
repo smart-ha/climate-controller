@@ -22,6 +22,7 @@
         "description": "Pick what to configure.",
         "menu_options": {
           "devices": "Devices & sensors",
+          "occupancy": "Occupancy schedule",
           "schedule_sleep": "Sleep schedule",
           "schedule_work": "Work schedule",
           "schedule_chill": "Chill schedule",
@@ -115,6 +116,56 @@
         "data": {
           "_back": "← Cancel (discard all changes on this screen)"
         }
+      },
+      "occupancy": {
+        "title": "Occupancy schedule",
+        "description": "A 24×7 grid of hourly slots, learned from motion sensors and editable by hand on the Lovelace card. The controller runs one action when somebody is expected and another when nobody is.\n\n{summary}",
+        "menu_options": {
+          "occupancy_sensors": "Motion sensors & preheat",
+          "occupancy_learning": "Learning window & threshold",
+          "occupancy_actions": "Actions per state",
+          "occupancy_maintenance": "Clear / reset the grid",
+          "init": "Back"
+        }
+      },
+      "occupancy_sensors": {
+        "title": "Motion sensors & preheat",
+        "description": "Learning starts as soon as motion sensors are selected — the toggle only decides whether the schedule is allowed to switch the controller. Watch the grid fill in for a week first if you like.\n\nPreheat is how early the expected state starts, so underfloor heating has time to make the floor warm before anyone arrives.",
+        "data": {
+          "enabled": "Let the schedule control the climate entity",
+          "motion_sensors": "Motion / occupancy sensors",
+          "preheat_minutes": "Preheat lead time (minutes)",
+          "motion_hold_minutes": "Hold the expected state after motion (minutes)",
+          "_back": "← Cancel (don't save changes on this screen)"
+        }
+      },
+      "occupancy_learning": {
+        "title": "Learning window & threshold",
+        "description": "Each slot is observed once a week. Its score is the share of the recent weeks in which motion was seen — 2 of the last 4 Mondays at 13:00 is 0.5. Slots at or above the threshold turn blue and drive the schedule; slots that saw motion but stayed below it are shown grey.",
+        "data": {
+          "learning_weeks": "Learning window (weeks)",
+          "learning_threshold": "Threshold (0–1)",
+          "learning_min_days": "Ignore learned slots until this many days have been observed",
+          "_back": "← Cancel (don't save changes on this screen)"
+        }
+      },
+      "occupancy_actions": {
+        "title": "Actions per state",
+        "description": "Applied once on each transition, so a manual change made in between is left alone until the next one.",
+        "data": {
+          "expected_action": "When somebody is expected (incl. preheat)",
+          "away_action": "When nobody is expected",
+          "_back": "← Cancel (don't save changes on this screen)"
+        }
+      },
+      "occupancy_maintenance": {
+        "title": "Clear / reset the grid",
+        "description": "Both act immediately — they change stored history, not the draft this flow saves on exit.",
+        "data": {
+          "clear_overrides": "Clear every manual cell",
+          "reset_learning": "Forget the learned history (keeps manual cells)",
+          "_back": "← Back (do nothing)"
+        }
       }
     },
     "error": {
@@ -128,6 +179,16 @@
         "min": "Minimum — heat until the coldest room is satisfied",
         "max": "Maximum — stop when the warmest room is satisfied",
         "median": "Median — ignores a single outlying sensor"
+      }
+    },
+    "occupancy_action": {
+      "options": {
+        "none": "Do nothing",
+        "off": "Turn the controller off",
+        "on": "Turn the controller on (AUTO)",
+        "preset_work": "Switch to the Work preset",
+        "preset_chill": "Switch to the Chill preset",
+        "preset_sleep": "Switch to the Sleep preset"
       }
     }
   }

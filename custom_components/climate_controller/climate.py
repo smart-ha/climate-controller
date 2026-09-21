@@ -15,6 +15,7 @@ from homeassistant.const import (
     UnitOfTemperature,
 )
 from homeassistant.core import Event, HomeAssistant, callback
+from homeassistant.helpers import config_validation as cv, entity_platform
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import (
     async_call_later,
@@ -22,20 +23,29 @@ from homeassistant.helpers.event import (
     async_track_time_interval,
 )
 from homeassistant.helpers.restore_state import RestoreEntity
+import voluptuous as vol
 import datetime as dt
 
 from .const import (
+    ACTION_NONE,
+    ACTION_OFF,
+    ACTION_ON,
+    ACTION_PRESET_PREFIX,
     ACTUATION_DEADBAND,
+    DAYS_PER_WEEK,
     DEFAULT_KD,
     DEFAULT_KI,
     DEFAULT_KP,
     DOMAIN,
     DEFAULT_MAX_DEVICE_DELTA_C,
+    HOURS_PER_DAY,
     OUTPUT_MAX,
     OUTPUT_MIN,
     PWM_WINDOW_SECONDS,
+    SLOT_MODES,
     TICK_INTERVAL_SECONDS,
 )
+from .occupancy import OccupancyController
 from .pid import PidController
 from .sensors import (
     aggregation_method,
@@ -53,6 +63,27 @@ HVAC_MODES = [HVACMode.OFF, HVACMode.AUTO]
 # time-of-day schedule. The three named presets carry fixed defaults + schedules.
 PRESET_MODES = [PRESET_NONE, "work", "chill", "sleep"]
 
+# Occupancy grid editing is entity-scoped (each controller learns its own
+# week), so these go through the entity service mechanism — that is what lets
+# the Lovelace card address a slot with nothing but `entity_id`.
+SERVICE_SET_OCCUPANCY_SLOT = "set_occupancy_slot"
+SERVICE_CLEAR_OCCUPANCY_OVERRIDES = "clear_occupancy_overrides"
+SERVICE_RESET_OCCUPANCY_LEARNING = "reset_occupancy_learning"
+
+# ``day`` and ``hour`` accept a scalar or a list and are applied as a
+# rectangle (every listed day × every listed hour). The card's drag-select is
+# exactly a rectangle, so painting 20 cells stays one service call.
+SET_OCCUPANCY_SLOT_SCHEMA = {
+    vol.Required("day"): vol.All(
+        cv.ensure_list, [vol.All(vol.Coerce(int), vol.Range(min=0, max=DAYS_PER_WEEK - 1))]
+    ),
+    vol.Required("hour"): vol.All(
+        cv.ensure_list,
+        [vol.All(vol.Coerce(int), vol.Range(min=0, max=HOURS_PER_DAY - 1))],
+    ),
+    vol.Required("mode"): vol.In(SLOT_MODES),
+}
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -64,6 +95,19 @@ async def async_setup_entry(
     name = config_entry.data.get("name", "Climate Controller")
     device = ClimateControllerDevice(name, config_entry)
     async_add_entities([device], True)
+
+    platform = entity_platform.async_get_current_platform()
+    platform.async_register_entity_service(
+        SERVICE_SET_OCCUPANCY_SLOT,
+        SET_OCCUPANCY_SLOT_SCHEMA,
+        "async_set_occupancy_slot",
+    )
+    platform.async_register_entity_service(
+        SERVICE_CLEAR_OCCUPANCY_OVERRIDES, {}, "async_clear_occupancy_overrides"
+    )
+    platform.async_register_entity_service(
+        SERVICE_RESET_OCCUPANCY_LEARNING, {}, "async_reset_occupancy_learning"
+    )
 
 
 class ClimateControllerDevice(ClimateEntity, RestoreEntity):
@@ -119,6 +163,13 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
         # state machine lands in idle. Force _enter_idle_zone once on
         # first tick so the known-idle starting condition is restored.
         self._first_evaluate: bool = True
+        # Occupancy schedule. The controller is built in async_added_to_hass,
+        # once hass (and the loaded store) is available.
+        self._occupancy: OccupancyController | None = None
+        # Last occupancy state we acted on. Restored from the previous session
+        # so an HA restart mid-evening doesn't re-fire the expected action —
+        # which would stomp a manual change the user made after the transition.
+        self._occupancy_state: str | None = None
 
     @property
     def name(self) -> str:
@@ -169,13 +220,46 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
             entity_id: read_sensor_celsius(self.hass, entity_id)
             for entity_id in sensor_ids
         }
-        return {
+        attributes: dict[str, Any] = {
             "temperature_aggregation": aggregation_method(entry_data),
             "temperature_sensors": sensor_ids,
             "temperature_readings": readings,
             "temperature_sensors_unavailable": [
                 entity_id for entity_id, value in readings.items() if value is None
             ],
+        }
+        attributes.update(self._occupancy_attributes())
+        return attributes
+
+    def _occupancy_attributes(self) -> dict[str, Any]:
+        """Everything the Lovelace card needs to draw the 24×7 grid.
+
+        The grid is published as 7 rows of 24 cell codes (see ``const.py``)
+        plus the matching per-cell scores, so the card can colour a cell and
+        explain it ("2 of the last 4 weeks") without a second round trip.
+        """
+        occupancy = self._occupancy
+        if occupancy is None:
+            return {"occupancy_enabled": False}
+
+        last_motion = occupancy.last_motion
+        return {
+            "occupancy_enabled": occupancy.enabled,
+            "occupancy_state": self._occupancy_state,
+            "occupancy_grid": occupancy.grid_by_day(),
+            "occupancy_scores": occupancy.scores_by_day(),
+            "occupancy_threshold": occupancy.learning_threshold,
+            "occupancy_learning_weeks": occupancy.learning_weeks,
+            "occupancy_learning_days": occupancy.store.days_observed,
+            "occupancy_learning_min_days": occupancy.learning_min_days,
+            "occupancy_preheat_minutes": occupancy.preheat_minutes,
+            "occupancy_motion_sensors": occupancy.motion_sensors,
+            "occupancy_last_motion": (
+                last_motion.isoformat() if last_motion is not None else None
+            ),
+            "occupancy_overrides": occupancy.store.override_count,
+            "occupancy_expected_action": occupancy.expected_action,
+            "occupancy_away_action": occupancy.away_action,
         }
 
     async def async_added_to_hass(self) -> None:
@@ -207,6 +291,11 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
                     restored["target_temperature"] = self._target_temperature
                 except (TypeError, ValueError):
                     pass
+
+            occupancy_candidate = last_state.attributes.get("occupancy_state")
+            if isinstance(occupancy_candidate, str):
+                self._occupancy_state = occupancy_candidate
+                restored["occupancy_state"] = occupancy_candidate
 
             if restored:
                 _LOGGER.info(
@@ -264,6 +353,30 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
                 async_track_state_change_event(
                     self.hass, sensor_ids, self._handle_sensor_event
                 )
+            )
+
+        # Occupancy: the learned week lives in a Store set up by
+        # async_setup_entry, shared by the entity and the OptionsFlow.
+        store = (
+            self.hass.data.get(DOMAIN, {})
+            .get(self._config_entry.entry_id, {})
+            .get("occupancy")
+        )
+        if store is not None:
+            self._occupancy = OccupancyController(
+                self.hass, self._config_entry, store, self._name
+            )
+            motion_sensors = self._occupancy.motion_sensors
+            if motion_sensors:
+                self._unsub_callbacks.append(
+                    async_track_state_change_event(
+                        self.hass, motion_sensors, self._handle_motion_event
+                    )
+                )
+        else:
+            _LOGGER.warning(
+                "climate_controller[%s]: occupancy store missing, schedule disabled",
+                self._name,
             )
 
         # Следим за управляемыми устройствами: вернувшееся из unavailable
@@ -382,8 +495,109 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
     @callback
     def _handle_tick(self, _now) -> None:
         """Periodic tick — re-evaluate even if the sensor didn't change."""
+        self.hass.async_create_task(self._async_tick())
+
+    async def _async_tick(self) -> None:
+        """One controller tick: occupancy first, then the PID loop.
+
+        Occupancy goes first because an expected→away transition may switch
+        the preset or turn the controller off, and the PID pass that follows
+        should already work against the new target rather than actuating once
+        against the old one.
+        """
+        await self._process_occupancy()
         self._evaluate()
         self.async_write_ha_state()
+
+    @callback
+    def _handle_motion_event(self, event: Event) -> None:
+        """A motion sensor fired — react now, don't wait for the next tick.
+
+        Only the off→on edge matters: `on` is what counts both as a learning
+        observation for the current slot and as the live trigger that
+        outranks the forecast.
+        """
+        new_state = event.data.get("new_state")
+        if new_state is None or new_state.state != "on":
+            return
+        if self._occupancy is None:
+            return
+        self._occupancy.note_motion()
+        self.hass.async_create_task(self._async_tick())
+
+    async def _process_occupancy(self) -> None:
+        """Advance the occupancy schedule and act on a state transition.
+
+        The configured action is applied only *on* a transition, so a manual
+        change (different preset, turned off by hand) survives until the next
+        expected↔away boundary — and is then overridden, which is what makes
+        a schedule a schedule.
+        """
+        occupancy = self._occupancy
+        if occupancy is None or not occupancy.motion_sensors:
+            return
+
+        # Learning runs as soon as sensors are configured, whether or not the
+        # schedule is allowed to act: a week of watching the grid fill in is
+        # exactly how you decide on a threshold before handing it the room.
+        now = occupancy.tick()
+        if not occupancy.enabled:
+            if self._occupancy_state is not None:
+                # Switched off mid-session: forget the state so re-enabling it
+                # applies the action instead of assuming the entity is already
+                # where the schedule wants it.
+                self._occupancy_state = None
+            return
+
+        state = occupancy.evaluate(now)
+        previous = self._occupancy_state
+        if state == previous:
+            return
+
+        self._occupancy_state = state
+        action = occupancy.action_for(
+            state, occupancy.expected_action, occupancy.away_action
+        )
+        _LOGGER.info(
+            "climate_controller[%s]: occupancy %s → %s, applying action '%s'",
+            self._name,
+            previous,
+            state,
+            action,
+        )
+        await self._apply_occupancy_action(action)
+
+    async def _apply_occupancy_action(self, action: str) -> None:
+        """Run one configured occupancy action against this entity."""
+        if action == ACTION_NONE:
+            return
+        if action == ACTION_OFF:
+            await self.async_set_hvac_mode(HVACMode.OFF)
+            return
+        if action == ACTION_ON:
+            await self.async_set_hvac_mode(HVACMode.AUTO)
+            return
+        if action.startswith(ACTION_PRESET_PREFIX):
+            preset = action[len(ACTION_PRESET_PREFIX) :]
+            if preset not in PRESET_MODES:
+                _LOGGER.warning(
+                    "climate_controller[%s]: unknown preset '%s' in occupancy action",
+                    self._name,
+                    preset,
+                )
+                return
+            # A preset is only meaningful while the controller runs, so the
+            # action implies turning it on — otherwise "expected → work" would
+            # silently do nothing after an away period that turned it off.
+            if self._hvac_mode == HVACMode.OFF:
+                await self.async_set_hvac_mode(HVACMode.AUTO)
+            await self.async_set_preset_mode(preset)
+            return
+        _LOGGER.warning(
+            "climate_controller[%s]: unknown occupancy action '%s'",
+            self._name,
+            action,
+        )
 
     def _scheduled_target_for(self, preset_mode: str) -> float | None:
         """If the active preset has at least one schedule point, return the
@@ -1189,3 +1403,58 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
             # overwrite this value on the next tick) no longer applies.
             self._preset_mode = PRESET_NONE
             self.async_write_ha_state()
+
+    # ------------------------------------------------------------------
+    # Occupancy grid services (driven by the Lovelace card)
+    # ------------------------------------------------------------------
+
+    async def async_set_occupancy_slot(
+        self, day: list[int], hour: list[int], mode: str
+    ) -> None:
+        """Force the given slots on/off, or hand them back to learning.
+
+        Applied as a rectangle — every listed day × every listed hour — which
+        is what a drag across the card selects.
+        """
+        if self._occupancy is None:
+            return
+        for one_day in day:
+            for one_hour in hour:
+                self._occupancy.store.set_override(one_day, one_hour, mode)
+        self._occupancy.store.schedule_save()
+        _LOGGER.info(
+            "climate_controller[%s]: occupancy slots days=%s hours=%s set to '%s'",
+            self._name,
+            day,
+            hour,
+            mode,
+        )
+        await self._async_tick()
+
+    async def async_clear_occupancy_overrides(self) -> None:
+        """Drop every manual cell, leaving a purely learned week."""
+        if self._occupancy is None:
+            return
+        dropped = self._occupancy.store.clear_overrides()
+        self._occupancy.store.schedule_save()
+        _LOGGER.info(
+            "climate_controller[%s]: cleared %d occupancy override(s)",
+            self._name,
+            dropped,
+        )
+        await self._async_tick()
+
+    async def async_reset_occupancy_learning(self) -> None:
+        """Forget the observed history and start learning again.
+
+        Manual cells are deliberately kept: they are the part the user typed
+        in, and "relearn the week" is not a request to throw that away.
+        """
+        if self._occupancy is None:
+            return
+        self._occupancy.store.reset_learning()
+        self._occupancy.store.schedule_save()
+        _LOGGER.info(
+            "climate_controller[%s]: occupancy learning reset", self._name
+        )
+        await self._async_tick()
