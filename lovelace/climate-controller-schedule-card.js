@@ -95,6 +95,9 @@ const STYLES = `
     cursor: pointer;
   }
   .cell:hover { filter: brightness(1.15); }
+  /* .cell already paints the empty state; this exists so a legend swatch can
+     show it too, without relying on .cell. */
+  .c-inactive  { background: var(--cc-empty); }
   .c-auto      { background: var(--cc-auto); }
   .c-manual-on { background: var(--cc-manual); }
   .c-seen      { background: var(--cc-seen); }
@@ -111,9 +114,14 @@ const STYLES = `
     margin-top: 12px; font-size: .78em; color: var(--secondary-text-color);
   }
   .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  /* No background here on purpose. A swatch is always rendered with one of
+     the cell-colour classes above, and those have the same specificity as
+     this rule — so a background declared here would win on source order
+     alone and paint every swatch the same grey. The grid itself is unaffected
+     because .cell is declared *before* the colour classes. */
   .swatch {
     width: 11px; height: 11px; border-radius: 3px;
-    display: inline-block; background: var(--cc-empty);
+    display: inline-block;
   }
   .footer {
     margin-top: 8px; font-size: .78em; color: var(--secondary-text-color);
@@ -250,6 +258,7 @@ class ClimateControllerScheduleCard extends HTMLElement {
         <span><i class="swatch c-manual-off"></i>forced off</span>
         <span><i class="swatch c-seen"></i>below threshold</span>
         <span><i class="swatch preheat"></i>preheat</span>
+        <span><i class="swatch c-inactive"></i>never seen</span>
       </div>`);
     parts.push(`<div class="footer"></div>`);
     parts.push(`</ha-card>`);
