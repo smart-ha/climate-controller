@@ -448,6 +448,12 @@ class OccupancyController:
     def tick(self, now: dt.datetime | None = None) -> dt.datetime:
         """Per-tick bookkeeping: poll sensors, roll the slot, queue a save."""
         now = now or dt_util.now()
+        if not self.motion_sensors:
+            # No sensors is a legitimate setup, not a disabled one: a grid
+            # painted entirely by hand needs no observations. Skip the slot
+            # rollover too — recording "no motion" for every hour of a week
+            # nobody was watching would be inventing data.
+            return now
         if self._motion_now():
             self.note_motion(now)
         if self.store.roll(now):

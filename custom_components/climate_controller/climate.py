@@ -539,12 +539,14 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
         a schedule a schedule.
         """
         occupancy = self._occupancy
-        if occupancy is None or not occupancy.motion_sensors:
+        if occupancy is None:
             return
 
         # Learning runs as soon as sensors are configured, whether or not the
         # schedule is allowed to act: a week of watching the grid fill in is
         # exactly how you decide on a threshold before handing it the room.
+        # With no sensors at all, tick() is a no-op that just reports the time
+        # — a grid painted by hand drives the controller all the same.
         now = occupancy.tick()
         if not occupancy.enabled:
             if self._occupancy_state is not None:

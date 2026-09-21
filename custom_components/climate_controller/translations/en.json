@@ -130,10 +130,10 @@
       },
       "occupancy_sensors": {
         "title": "Motion sensors & preheat",
-        "description": "Learning starts as soon as motion sensors are selected — the toggle only decides whether the schedule is allowed to switch the controller. Watch the grid fill in for a week first if you like.\n\nPreheat is how early the expected state starts, so underfloor heating has time to make the floor warm before anyone arrives.",
+        "description": "Sensors are optional. With them, the grid fills itself in and learning starts as soon as they are selected; without them, the grid is whatever you paint on the Lovelace card. The toggle only decides whether the schedule is allowed to switch the controller.\n\nThe grid itself is edited on the card — click a cell, or drag a rectangle. There is no grid editor on this screen.\n\nPreheat is how early the expected state starts, so underfloor heating has time to make the floor warm before anyone arrives.",
         "data": {
           "enabled": "Let the schedule control the climate entity",
-          "motion_sensors": "Motion / occupancy sensors",
+          "motion_sensors": "Motion / occupancy sensors (optional)",
           "preheat_minutes": "Preheat lead time (minutes)",
           "motion_hold_minutes": "Hold the expected state after motion (minutes)",
           "_back": "← Cancel (don't save changes on this screen)"
