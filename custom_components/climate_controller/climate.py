@@ -462,7 +462,8 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
     async def _reconcile_device(self, entity_id: str) -> None:
         """Bring a just-returned device in line with the controller state.
 
-        * passive — nothing to do, ``_drive_passive_devices`` steers it every tick;
+        * passive or direct — nothing to do, ``_drive_passive_devices`` /
+          ``_drive_direct_devices`` steer them every tick;
         * controller OFF — suspend (same as the AUTO→OFF transition);
         * idle zone, or active zone of the opposite side — park in idle;
         * active zone of its own side (or bidir) — re-evaluate right away
@@ -475,7 +476,11 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
         needs_evaluate = False
         for key in list(self._pids):
             side, key_entity_id = key.split(":", 1)
-            if key_entity_id != entity_id or self._is_passive(side, entity_id):
+            if (
+                key_entity_id != entity_id
+                or self._is_passive(side, entity_id)
+                or self._is_direct(side, entity_id)
+            ):
                 continue
             if self._hvac_mode == HVACMode.OFF:
                 await self._release_device(key, suspend=True)
@@ -639,6 +644,30 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
         cfg = self._config_entry.data.get(f"{side}_config", {})
         return bool(cfg.get(entity_id, {}).get("passive", False))
 
+    def _is_direct(self, side: str, entity_id: str) -> bool:
+        """Is this device its own controller?
+
+        Underfloor heating driven by its own thermostat already regulates the
+        room; a PID on top of it is a second loop fighting the first. A
+        ``direct`` device is simply told the controller's target temperature
+        verbatim — no PID shift, no measurement-anchored clamp, no deadband —
+        and decides for itself when to actually heat.
+
+        Only meaningful for ``climate.*`` targets: a switch has no setpoint to
+        mirror, so it keeps being driven by PWM whatever the flag says.
+        """
+        if not entity_id.startswith("climate."):
+            return False
+        if side == "bidir":
+            cooling_cfg = self._config_entry.data.get("cooling_config", {})
+            heating_cfg = self._config_entry.data.get("heating_config", {})
+            return bool(
+                cooling_cfg.get(entity_id, {}).get("direct", False)
+                or heating_cfg.get(entity_id, {}).get("direct", False)
+            )
+        cfg = self._config_entry.data.get(f"{side}_config", {})
+        return bool(cfg.get(entity_id, {}).get("direct", False))
+
     def _has_active_managed_devices(self) -> bool:
         """Return True if any non-passive registered device is currently in
         an active state (switch on, climate in heat/cool/auto/dry/etc.).
@@ -647,10 +676,16 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
         races: if a device was unavailable during _enter_idle_zone and
         later came back online in stale active state, this returns True so
         the caller fires another _enter_idle_zone pass.
+
+        Direct devices are excluded alongside passive ones. A floor
+        thermostat holding its own setpoint sits in ``heat`` permanently and
+        would otherwise report "still active" on every idle tick, firing
+        _enter_idle_zone forever — which resets the *other* devices' PIDs
+        each time.
         """
         for key in self._pids:
             side, entity_id = key.split(":", 1)
-            if self._is_passive(side, entity_id):
+            if self._is_passive(side, entity_id) or self._is_direct(side, entity_id):
                 continue
             state = self.hass.states.get(entity_id)
             if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
@@ -700,6 +735,11 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
         # Done before the zone machine's early idle-return so idle-zone and OFF
         # ticks still regulate them.
         self._drive_passive_devices(setpoint, measured, dt_seconds)
+
+        # Direct devices are likewise driven before the zone machine: they are
+        # their own controller, so parking them in the idle zone would be us
+        # switching off the very thermostat we delegated the room to.
+        self._drive_direct_devices(setpoint, measured)
 
         # Three-zone state machine with asymmetric hysteresis. Width is
         # `temp_threshold` on entry into active zones (idle → heating /
@@ -764,6 +804,10 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
                 # Passive devices are already regulated in
                 # _drive_passive_devices() (unconditionally, incl. OFF). Skip
                 # here so their PID isn't advanced twice per tick.
+                continue
+            if self._is_direct(side, entity_id):
+                # Handled by _drive_direct_devices(); there is no PID output to
+                # compute for a device we only hand the target to.
                 continue
             if is_off:
                 # Non-passive device, controller OFF — stays suspended
@@ -832,6 +876,10 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
             side, entity_id = key.split(":", 1)
             if not self._is_passive(side, entity_id):
                 continue
+            if self._is_direct(side, entity_id):
+                # passive + direct: always on, and holding our target rather
+                # than a PID-shifted one. _drive_direct_devices owns it.
+                continue
             output = pid.update(setpoint, measured, dt_seconds)
             _LOGGER.debug(
                 "climate_controller[%s]: passive drive side=%s device=%s "
@@ -853,6 +901,46 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
                 continue
             self.hass.async_create_task(
                 self._actuate(side, entity_id, setpoint, output, measured)
+            )
+
+    def _drive_direct_devices(self, setpoint: float, measured: float) -> None:
+        """Hand every *direct* device the controller's target, verbatim.
+
+        Direct devices (``cfg["direct"] = True``, climate.* only) run their own
+        thermostat — underfloor heating being the case this exists for. Putting
+        a PID in front of one means two loops chasing the same room, so instead
+        we only forward the setpoint the user sees on the controller card and
+        let the device decide when to fire.
+
+        Consequences, all following from "it is its own controller":
+
+        * no PID shift, no measurement-anchored ``max_delta`` clamp, no
+          deadband — the value sent is the controller's target, adjusted only
+          by the device's own min/max and step;
+        * driven on every tick, including the idle zone, and not parked by
+          ``_enter_idle_zone`` — parking would switch off the thermostat we
+          just delegated the room to;
+        * still physically turned off when the controller goes to ``OFF``,
+          because on/off remains ours. Combine with ``passive`` for equipment
+          that must never be switched off at all.
+        """
+        is_off = self._hvac_mode == HVACMode.OFF
+        for key in self._pids:
+            side, entity_id = key.split(":", 1)
+            if not self._is_direct(side, entity_id):
+                continue
+            if is_off and not self._is_passive(side, entity_id):
+                # Suspended on the AUTO→OFF transition; leave it off.
+                continue
+            _LOGGER.debug(
+                "climate_controller[%s]: direct drive side=%s device=%s setpoint=%.2f",
+                self._name,
+                side,
+                entity_id,
+                setpoint,
+            )
+            self.hass.async_create_task(
+                self._actuate_climate_direct(side, entity_id, setpoint, measured)
             )
 
     async def _actuate(
@@ -1232,6 +1320,84 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
             "climate", "set_temperature", service_data, blocking=False
         )
 
+    @staticmethod
+    def _same_target(state, target: float) -> bool:
+        """Does the device already hold exactly this setpoint?
+
+        A device that reports no numeric target at all returns False — better
+        one redundant service call than a setpoint that silently never lands.
+        """
+        current = state.attributes.get("temperature")
+        try:
+            current_f = float(current) if current is not None else None
+        except (TypeError, ValueError):
+            current_f = None
+        if current_f is None:
+            return False
+        return abs(current_f - target) < 0.05
+
+    async def _actuate_climate_direct(
+        self, side: str, entity_id: str, setpoint: float, measured: float
+    ) -> None:
+        """Mirror the controller's target onto a self-regulating device.
+
+        Same shape as :meth:`_actuate_climate`, minus every correction the PID
+        path applies: the target is the controller's setpoint, passed through
+        :meth:`_compute_climate_target` with a zero shift and no measurement,
+        so only the device's own min/max and ``target_temp_step`` touch it.
+        """
+        state = self.hass.states.get(entity_id)
+        if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            _LOGGER.warning(
+                "climate_controller[%s]: %s is unavailable, skipping direct actuation",
+                self._name,
+                entity_id,
+            )
+            return
+
+        target = self._compute_climate_target(
+            state, setpoint, 0.0, measured=None, max_delta=None
+        )
+        service_data: dict[str, Any] = {
+            "entity_id": entity_id,
+            ATTR_TEMPERATURE: target,
+        }
+
+        # Deliberately *not* _already_at_target: that one skips when the device
+        # is within `temp_threshold` (a whole degree in a typical setup), which
+        # is the right tolerance for a PID chasing a moving target and the
+        # wrong one here. "Direct" promises the device holds the same number
+        # the card shows, so anything but an exact match is worth a call.
+        # _compute_climate_target has already quantised to the device's step.
+        already_at_target = self._same_target(state, target)
+
+        if side == "bidir":
+            # A bidirectional device still needs to be told which way to work;
+            # with no PID output to read a sign off, the room does it.
+            planned_hvac_mode = (
+                HVACMode.HEAT if measured is None or setpoint >= measured
+                else HVACMode.COOL
+            )
+            if state.state == planned_hvac_mode and already_at_target:
+                return
+            if state.state != planned_hvac_mode:
+                await self._ensure_hvac_mode(entity_id, planned_hvac_mode)
+        else:
+            # A device sitting in `off` ignores set_temperature, so flip it to
+            # its side's mode first. Otherwise leave the mode alone — the
+            # device is the one deciding how to hold the setpoint.
+            force_mode_off_path = state.state == HVACMode.OFF
+            if not force_mode_off_path and already_at_target:
+                return
+            if force_mode_off_path:
+                await self._ensure_hvac_mode(
+                    entity_id, HVACMode.HEAT if side == "heating" else HVACMode.COOL
+                )
+
+        await self.hass.services.async_call(
+            "climate", "set_temperature", service_data, blocking=False
+        )
+
     def _already_at_target(
         self,
         entity_id: str,
@@ -1370,11 +1536,13 @@ class ClimateControllerDevice(ClimateEntity, RestoreEntity):
 
         Symmetric to :meth:`_suspend_active_devices` (cancels pending PWM
         off-pulses, resets PIDs, clears pwm_fractions) — passive devices
-        are observed-only and deliberately untouched.
+        are observed-only and deliberately untouched, and direct devices run
+        their own thermostat, so parking them would switch off the regulation
+        we delegated to them.
         """
         for key in list(self._pids.keys()):
             side, entity_id = key.split(":", 1)
-            if self._is_passive(side, entity_id):
+            if self._is_passive(side, entity_id) or self._is_direct(side, entity_id):
                 continue
             await self._release_device(key, suspend=False)
 

@@ -31,7 +31,7 @@
       },
       "devices": {
         "title": "Devices & sensors",
-        "description": "Sensors, fixed preset temperatures, and the cooling/heating devices the controller drives. Several temperature sensors can be selected; they are combined into one measurement by the chosen method.",
+        "description": "Sensors, fixed preset temperatures, and the cooling/heating devices the controller drives. Several temperature sensors can be selected; they are combined into one measurement by the chosen method.\n\nPer-device rows (climate.* only): tick `direct` for equipment that regulates the room itself, such as underfloor heating on its own thermostat. A direct device is simply handed the controller's target temperature — no PID, no deviation limit — and is never parked when the room reaches target. It is still switched off when the controller is turned off, unless `passive` is also ticked. `max_delta` is ignored for direct devices.",
         "data": {
           "name": "Configuration name",
           "temp_threshold": "Temperature threshold for switching cooling/heating (°C)",

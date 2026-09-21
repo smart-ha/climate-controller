@@ -165,6 +165,9 @@ def _build_device_config(
                     user_input.get(f"{field_prefix}_dev_{prev_i}_max_delta"),
                     prev_config.get(device, {}).get("max_delta"),
                 )
+                entry["direct"] = user_input.get(
+                    f"{field_prefix}_dev_{prev_i}_direct", False
+                )
         else:
             existing = prev_config.get(device, {})
             entry = {
@@ -174,6 +177,7 @@ def _build_device_config(
             }
             if _is_thermostat(device):
                 entry["max_delta"] = _coerce_delta(None, existing.get("max_delta"))
+                entry["direct"] = existing.get("direct", False)
         new_config[device] = entry
     return new_config
 
@@ -202,8 +206,9 @@ def _add_device_rows(
 ) -> None:
     """Add per-device enable/passive fields to the schema.
 
-    climate.* devices additionally get a max-deviation field; on/off
-    devices have no set_temperature to clamp.
+    climate.* devices additionally get a max-deviation field and the
+    direct-control checkbox; on/off devices have no set_temperature to clamp
+    or to mirror.
     """
     for i, device in enumerate(devices):
         device_config = config.get(device, {})
@@ -220,6 +225,12 @@ def _add_device_rows(
             )
         ] = bool
         if _is_thermostat(device):
+            schema[
+                vol.Required(
+                    f"{field_prefix}_dev_{i}_direct",
+                    default=device_config.get("direct", False),
+                )
+            ] = bool
             schema[
                 vol.Required(
                     f"{field_prefix}_dev_{i}_max_delta",
